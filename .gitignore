@@ -1,0 +1,16 @@
+# raw profiling data and compiled binaries (regenerable, large)
+perf.data*
+perf.zip
+measurements/*/program
+measurements/*/quicksort
+
+# LaTeX build output
+build/
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
