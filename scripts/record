@@ -1,0 +1,846 @@
+#!/bin/sh
+# record -- measure a program: where its CPU time goes (perf) and how
+# often each instruction runs (callgrind)
+#
+# Usage:
+#   record all -n <nick> [-r <runs>] [-u] [-c <cycles>] [-m <dir>]
+#              <program> [<arg>...]
+#   record time -n <nick> [-u] [-c <cycles>] [-m <dir>]
+#               <program> [<arg>...]
+#   record count -n <nick> [-m <dir>] <program> [<arg>...]
+#
+#   all          tune the system, record time <runs> times, restore the
+#                system, then record count once; as root
+#   time         sample where the program spends its CPU cycles, with
+#                perf, on the CPU that tune isolated; as root, with tune
+#                hold running in another terminal (or -u)
+#   count        count exactly how many times each instruction runs,
+#                with callgrind; needs no root or tuning
+#
+#   -n <nick>    a nickname for the system measured on (hardware and
+#                software), e.g. t14
+#   -r <runs>    how many time runs to record (default 1)
+#   -u           untuned baseline: skip tune, run the program anywhere
+#   -c <cycles>  sampling period for perf (default 100003); fewer samples
+#                disturb the program less
+#   -m <dir>     the measurements folder (default: measurements/ in the
+#                repo)
+#
+# all restores the system also on errors and Ctrl-C. It counts after
+# that, as the user who ran sudo: counts do not depend on tuning, and
+# callgrind is slow.
+#
+# Time runs by hand, from two terminals:
+#   sudo scripts/tune hold
+#   sudo scripts/record time -n t14 ./build/quicksort 100000000
+#
+# Layout under the measurements folder:
+#
+#   platforms/t14-1.txt                  the system: hardware, OS,
+#                                        versions, ...
+#   <program>/binaries/<hash>            each build of the program, once
+#   <program>/time/t14-1.run1.<file>     runs, numbered per platform
+#   <program>/time/failed/t14-1.run2/    a run that failed
+#   <program>/count/...                  the same for counts
+#
+# A time run's files (<run> is e.g. t14-1.run1):
+#   <run>.samples.txt   "rank count location (dso)", all code, kernel too
+#   <run>.meta.txt      what was run, how it was sampled, and the
+#                       program's output
+#   <run>.perf.data     raw samples
+#
+# A count run's files:
+#   <run>.counts.txt      "rank count location (dso)", all user-space code
+#   <run>.meta.txt        what was run, and the program's output
+#   <run>.callgrind.out   raw counts
+#   <run>.valgrind.log    load addresses, needed to rank the raw counts
+#
+# t14-1 is a platform: the system (t14) as it is now. When anything in
+# its platform file changes, new hardware or a kernel update say, the
+# next run creates t14-2 and shows what changed.
+#
+# A run is written into failed/<run>/ and moved out only when it
+# succeeds, so one that fails, is interrupted or crashes stays there,
+# with error.txt saying why. Run numbers count attempts: a gap among the
+# successful runs is the failed run with that number.
+#
+# Time: one sample every <cycles> cycles (cycles:P: the most precise
+# sampling the CPU supports); a prime period avoids falling into step
+# with loops. Only the program's own process is kept. perf runs outside
+# tune.slice and only the program inside it, keeping perf's own work off
+# the measured CPU. That relies on systemd-run --scope moving itself
+# into the slice before exec'ing the program, so a sample on any other
+# CPU fails the run.
+#
+# Count: locations are named as perf names them (sym+0xoff), so the
+# lists line up with the time runs'. Valgrind's own code is left out;
+# callgrind sees user space only.
+
+set -eu
+
+NAME=record
+SCRIPTS=$(dirname "$(readlink -f "$0")")
+CMDLINE="$0 $*"
+
+ROOT=
+PLATFORM=
+RUN=
+RUN_DIR=
+STAGE=
+BINARY=
+PROG=
+PROG_SHA=
+BASE=
+
+# records an error in the run being written, if there is one
+record_error() {
+	if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
+		echo "$1" >>"$STAGE/error.txt"
+	fi
+}
+
+die() {
+	echo "$NAME: error: $1" >&2
+	record_error "$1"
+	exit 1
+}
+
+die_cmd() {
+	echo "$NAME: error: $1" >&2
+	record_error "$1"
+	echo "" >&2
+	echo "fix it with:" >&2
+	echo "" >&2
+	echo "$2" >&2
+	echo "" >&2
+	if [ -n "${3:-}" ]; then
+		echo "$3" >&2
+		echo "" >&2
+	fi
+	exit 1
+}
+
+note() {
+	echo "$NAME: $1" >&2
+}
+
+# usage [0]: prints the header's Usage block and exits; with 0 (for -h)
+# to stdout, otherwise to stderr as an error
+usage() {
+	if [ "${1:-1}" = 0 ]; then
+		usage_block
+		exit 0
+	fi
+	usage_block >&2
+	exit 1
+}
+
+usage_block() {
+	awk '/^# Usage:/ { p = 1; print "usage:"; next }
+		p && !/^#   / && !/^#$/ { exit }
+		p && /^#$/ { blank++; next }
+		p { while (blank) { print ""; blank-- } sub(/^# /, ""); print }' "$0"
+}
+
+have() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+# install_hint apt-packages dnf-packages pacman-packages: the command
+# that installs them with this machine's package manager
+install_hint() {
+	if have apt-get; then
+		echo "sudo apt install $1"
+	elif have dnf; then
+		echo "sudo dnf install $2"
+	elif have pacman; then
+		echo "sudo pacman -S $3"
+	else
+		echo "(install $1 with your package manager)"
+	fi
+}
+
+# perf's package: per kernel on Ubuntu, linux-perf on Debian and
+# Raspberry Pi OS
+perf_hint() {
+	if grep -qi '^ID\(_LIKE\)\?=.*ubuntu' /etc/os-release 2>/dev/null; then
+		echo "sudo apt install linux-tools-common linux-tools-$(uname -r)"
+	else
+		install_hint linux-perf perf perf
+	fi
+}
+
+# commas n: n with thousands separators, 1234567 -> 1,234,567
+commas() {
+	awk -v n="$1" 'BEGIN {
+		while (length(n) > 3) { s = "," substr(n, length(n) - 2) s; n = substr(n, 1, length(n) - 3) }
+		print n s }'
+}
+
+# shown path: the path relative to the current folder, if it is inside it
+shown() {
+	case "$1" in
+	"$PWD"/*) echo "${1#"$PWD"/}" ;;
+	*) echo "$1" ;;
+	esac
+}
+
+check_nick() {
+	case "$1" in
+	"") die "a system nickname is required, e.g. -n t14" ;;
+	*[!A-Za-z0-9_]*) die "nickname '$1' may only contain letters, digits and _" ;;
+	esac
+}
+
+# check_period cycles: a sampling period for perf, if one was given
+check_period() {
+	case "$1" in
+	*[!0-9]* | 0*) die "-c takes a positive number of cycles, got '$1'" ;;
+	esac
+}
+
+# check_program path: sets PROG (absolute) and BASE (its file name). The
+# name ends up in file names and perf's process filter, which splits on
+# commas.
+check_program() {
+	PROG=$(readlink -f "$1")
+	[ -f "$PROG" ] && [ -x "$PROG" ] || die "not an executable file: $1"
+	BASE=$(basename "$PROG")
+	case "$BASE" in
+	*[[:space:]]* | *,*) die "the program's file name must not contain spaces or commas: $BASE" ;;
+	esac
+}
+
+need_root() {
+	if [ "$(id -u)" != 0 ]; then
+		die_cmd "must run as root ($1)" "sudo ${CMDLINE:-$0}"
+	fi
+}
+
+# own path...: under sudo, hands the files to the user who ran sudo
+own() {
+	if [ "$(id -u)" = 0 ] && [ -n "${SUDO_UID:-}" ] && [ "$SUDO_UID" != 0 ]; then
+		chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$@" || true
+	fi
+}
+
+# mkdir_own dir: mkdir -p, then owns the topmost folder it created
+mkdir_own() {
+	[ -e "$1" ] && return 0
+	top=$1
+	while [ ! -e "$(dirname "$top")" ]; do
+		top=$(dirname "$top")
+	done
+	mkdir -p "$1"
+	own "$top"
+}
+
+# Note why an unfinished run stopped, and hand its files to the user.
+on_exit() {
+	status=$?
+	if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
+		if [ "$status" != 0 ] && [ ! -e "$STAGE/error.txt" ]; then
+			echo "stopped with exit status $status (129: terminal closed, 130: Ctrl-C, 141: output pipe closed, 143: killed)" >"$STAGE/error.txt"
+		fi
+		own "$STAGE"
+	fi
+}
+
+# What surrounds the program and stays the same from run to run on one
+# machine. Tuning state, date and the program itself are per run and go
+# in the run's meta.txt instead.
+platform() {
+	# PCs describe themselves through DMI; ARM boards like the Raspberry
+	# Pi through the device tree
+	d=/sys/class/dmi/id
+	if [ -r "$d/sys_vendor" ]; then
+		echo "machine:   $(cat "$d/sys_vendor" "$d/product_version" "$d/product_name" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+		echo "firmware:  $(cat "$d/bios_version" 2>/dev/null)"
+	else
+		echo "machine:   $(tr -d '\0' 2>/dev/null </proc/device-tree/model || echo unknown)"
+		if have vcgencmd; then
+			echo "firmware:  $(vcgencmd version 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+		else
+			echo "firmware:  unknown"
+		fi
+	fi
+	LC_ALL=C lscpu | sed -n 's/^Model name: *\(.*\)/cpu:       \1/p'
+	echo "microcode: $(sed -n 's/^microcode[[:space:]]*: //p' /proc/cpuinfo | head -1)"
+	LC_ALL=C lscpu | awk -F ':[ \t]+' '/^(Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)|L[0-9][di]* cache):/ { print $1 ": " $2 }'
+	# lsmem counts whole memory blocks, steadier than MemTotal, but needs
+	# memory hotplug support, which many ARM kernels lack
+	mem=$(LC_ALL=C lsmem --summary --bytes 2>/dev/null | sed -n 's/^Total online memory: *//p')
+	if [ -n "$mem" ]; then
+		echo "memory:    $mem bytes"
+	else
+		echo "memory:    $(awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo) bytes (MemTotal)"
+	fi
+	echo "os:        $(. /etc/os-release && echo "$PRETTY_NAME")"
+	echo "kernel:    $(uname -srvm)"
+	echo "cmdline:   $(cat /proc/cmdline)"
+	echo "libc:      $(ldd --version 2>&1 | head -1)"
+	echo "perf:      $(perf --version 2>/dev/null || echo none)"
+	echo "valgrind:  $(valgrind --version 2>/dev/null || echo none)"
+}
+
+# highest N among names like <prefix>N<suffix> in a folder, or 0
+last_number() {
+	last=0
+	for f in "$1"/*; do
+		n=${f##*/}
+		case "$n" in
+		"$2"*"$3") ;;
+		*) continue ;;
+		esac
+		n=${n#"$2"}
+		n=${n%"$3"}
+		case "$n" in
+		"" | *[!0-9]*) continue ;;
+		esac
+		if [ "$n" -gt "$last" ]; then
+			last=$n
+		fi
+	done
+	echo "$last"
+}
+
+# start_run root kind nick: finds or creates the platform, stores PROG's
+# binary, picks the run number and creates the staging folder. An empty
+# root means measurements/ in the repo. Sets PLATFORM, RUN, RUN_DIR,
+# STAGE, BINARY and PROG_SHA.
+start_run() {
+	ROOT=${1:-$SCRIPTS/../measurements}
+	for d in "$ROOT/platforms" "$ROOT/$BASE/binaries" "$ROOT/$BASE/$2/failed"; do
+		mkdir_own "$d"
+	done
+	ROOT=$(readlink -f "$ROOT")
+	trap on_exit EXIT
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 141' PIPE
+	trap 'exit 143' TERM
+
+	current=$(platform)
+	for f in "$ROOT/platforms/$3"-*.txt; do
+		[ -f "$f" ] || continue
+		if [ "$(cat "$f")" = "$current" ]; then
+			PLATFORM=$(basename "$f" .txt)
+			break
+		fi
+	done
+	if [ -z "$PLATFORM" ]; then
+		last=$(last_number "$ROOT/platforms" "$3-" .txt)
+		PLATFORM=$3-$((last + 1))
+		printf '%s\n' "$current" >"$ROOT/platforms/$PLATFORM.txt"
+		own "$ROOT/platforms/$PLATFORM.txt"
+		if [ "$last" -gt 0 ]; then
+			note "new platform $PLATFORM; changed since $3-$last:"
+			diff "$ROOT/platforms/$3-$last.txt" "$ROOT/platforms/$PLATFORM.txt" >&2 || true
+		else
+			note "new platform $PLATFORM"
+		fi
+	fi
+
+	PROG_SHA=$(sha256sum "$PROG" | cut -d' ' -f1)
+	BINARY=$ROOT/$BASE/binaries/$(printf '%s' "$PROG_SHA" | cut -c1-12)
+	if [ ! -e "$BINARY" ]; then
+		cp "$PROG" "$BINARY"
+		own "$BINARY"
+	elif ! cmp -s "$PROG" "$BINARY"; then
+		die "$BINARY exists but differs from $PROG"
+	fi
+
+	RUN_DIR=$ROOT/$BASE/$2
+	a=$(last_number "$RUN_DIR" "$PLATFORM.run" .meta.txt)
+	b=$(last_number "$RUN_DIR/failed" "$PLATFORM.run" "")
+	if [ "$b" -gt "$a" ]; then
+		a=$b
+	fi
+	RUN=$PLATFORM.run$((a + 1))
+	mkdir "$RUN_DIR/failed/$RUN" || die "could not create $RUN_DIR/failed/$RUN"
+	STAGE=$RUN_DIR/failed/$RUN
+}
+
+# program_failed status [what]: stops with the program's exit status and
+# the end of what it printed to stderr
+program_failed() {
+	die "${2:-the program} exited with status $1:
+$(tail -n 5 "$STAGE/program.err" | sed 's/^/    /')
+(everything is in $STAGE)"
+}
+
+# noise_report cpu before after: what happened on the CPU between two
+# snapshots (taken by record_time's wrapper), as lines for meta.txt;
+# removes the snapshots.
+noise_report() {
+	# per-CPU counters: "label: n n n ... description", under a header
+	# naming the online CPUs; prints "label delta description" for cpu
+	delta_per_cpu() {
+		awk -v cpu="CPU$1" '
+			FNR == 1 {
+				col = 0
+				for (i = 1; i <= NF; i++) if ($i == cpu) col = i + 1
+				ncpu = NF
+				next
+			}
+			!col || NF < col { next }
+			{
+				desc = ""
+				for (i = ncpu + 2; i <= NF; i++) desc = desc (desc == "" ? "" : " ") $i
+				if (FILENAME == ARGV[1]) before[$1] = $col
+				else printf "%s %d %s\n", $1, $col - before[$1], desc
+			}
+		' "$2" "$3"
+	}
+	# "total, most from: A n (desc), B n, C n". perf's own sampling
+	# interrupts are counted apart: on x86 PMI, and again under NMI, so
+	# only NMIs beyond the PMIs (the watchdog, say) count as noise; on ARM
+	# a numbered interrupt whose name mentions the PMU (arm-pmu, say).
+	summarize() {
+		awk '
+			$1 == "NMI:" { nmi = $2; next }
+			$1 == "PMI:" { mine = $2; next }
+			{ d = tolower($0); sub(/^[^ ]+ [^ ]+ ?/, "", d) }
+			d ~ /pmu/ { mine += $2; next }
+			$2 > 0 { total += $2; print }
+			END {
+				if (nmi > mine) { total += nmi - mine; print "NMI:", nmi - mine, "non-perf NMIs" }
+				print "#", total + 0, mine + 0
+			}
+		' | sort -k2,2nr | awk '
+			/^#/ { total = $2; mine = $3; next }
+			n < 3 {
+				d = $0; sub(/^[^ ]+ [^ ]+ ?/, "", d)
+				top = top (n ? ", " : "") substr($1, 1, length($1) - 1) " " $2 (d != "" ? " (" d ")" : "")
+				n++
+			}
+			END {
+				printf "%d", total
+				if (mine) printf " (plus %d from perf'"'"'s own sampling)", mine
+				if (top != "") printf ", most from: %s", top
+				print ""
+			}'
+	}
+	echo "interrupts:    $(delta_per_cpu "$1" "$2.interrupts" "$3.interrupts" | summarize)"
+	echo "softirqs:      $(delta_per_cpu "$1" "$2.softirqs" "$3.softirqs" | summarize)"
+	# user nice system idle iowait irq softirq steal, in clock ticks
+	paste -d' ' "$2.stat" "$3.stat" | awk -v hz="$(getconf CLK_TCK)" '{
+		n = (NF - 2) / 2
+		for (i = 2; i <= 9; i++) { d[i] = $(i + n + 1) - $i; t += d[i] }
+		if (t == 0) { print "cpu time:      n/a"; exit }
+		printf "cpu time:      user %.1f%%, system %.1f%%, irq %.1f%%, softirq %.1f%%, idle %.1f%% of %.1f s\n",
+			100 * (d[2] + d[3]) / t, 100 * d[4] / t, 100 * d[7] / t, 100 * d[8] / t,
+			100 * (d[5] + d[6]) / t, t / hz }'
+	# cpuN ... running_ns waiting_ns timeslices
+	paste -d' ' "$2.schedstat" "$3.schedstat" | awk '{
+		n = NF / 2
+		printf "scheduling:    %d timeslices, tasks waited %.1f ms for the CPU\n",
+			$(2 * n) - $n, ($(2 * n - 1) - $(n - 1)) / 1e6 }'
+	paste -d' ' "$2.throttle" "$3.throttle" | awk '{
+		if ($1 == "-") print "throttling:    n/a"
+		else printf "throttling:    %d core, %d package events\n", $3 - $1, $4 - $2 }'
+	rm "$2".* "$3".*
+}
+
+# noise_summary report: noise_report's lines, as one short phrase
+noise_summary() {
+	awk '
+		$1 == "interrupts:" { irq = $2 + 0 }
+		$1 == "scheduling:" { slices = $2 + 0; wait = $6 }
+		$1 == "throttling:" { thr = ($2 == "n/a") ? "n/a" : $2 + $4 }
+		END {
+			printf "%s interrupts, %s timeslices, %s ms waiting, ", irq, slices, wait
+			if (thr == "n/a") print "throttling n/a"
+			else if (thr == 0) print "no throttling"
+			else printf "%d throttling events\n", thr
+		}' "$1"
+}
+
+# The lines every meta.txt starts with. Takes the program's arguments.
+meta_common() {
+	echo "run:           $RUN"
+	echo "date:          $(date -Iseconds)"
+	echo "platform:      $PLATFORM (see platforms/$PLATFORM.txt)"
+	echo "command:       $PROG $*"
+	echo "binary:        sha256 $PROG_SHA, stored as binaries/$(basename "$BINARY")"
+	echo "compiler:      $(readelf -p .comment "$PROG" 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | head -1)"
+	echo "aslr:          $(cat /proc/sys/kernel/randomize_va_space) (randomize_va_space; 2: full)"
+}
+
+# The program's output, for the end of meta.txt; removes the files.
+meta_output() {
+	for f in program.out program.err; do
+		echo ""
+		echo "== $f (first 100 lines)"
+		head -n 100 "$STAGE/$f"
+		rm "$STAGE/$f"
+	done
+}
+
+# finish_run: moves the run's files out of failed/ as <run>.<name>.
+finish_run() {
+	for f in "$STAGE"/*; do
+		[ -e "$f" ] || continue
+		own "$f"
+		mv "$f" "$RUN_DIR/$RUN.${f##*/}"
+	done
+	rmdir "$STAGE"
+	STAGE=
+	rmdir "$RUN_DIR/failed" 2>/dev/null || true
+}
+
+# record all: tune, time runs, restore, count
+record_all() {
+	NICK=
+	RUNS=1
+	UNTUNED=
+	PERIOD=
+	MDIR=
+	while getopts n:r:uc:m: opt; do
+		case "$opt" in
+		n) NICK=$OPTARG ;;
+		r) RUNS=$OPTARG ;;
+		u) UNTUNED=-u ;;
+		c) PERIOD=$OPTARG ;;
+		m) MDIR=$OPTARG ;;
+		*) usage ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	[ $# -ge 1 ] || usage
+	check_nick "$NICK"
+	case "$RUNS" in
+	"" | *[!0-9]* | 0*) die "-r takes a positive number of runs, got '$RUNS'" ;;
+	esac
+	check_period "$PERIOD"
+	# checked here too, so a bad path fails before the system is tuned
+	check_program "$1"
+
+	need_root "tuning and perf need it"
+	if [ -z "$UNTUNED" ] && [ -f /run/tune.state ]; then
+		die_cmd "the system is already tuned, by something other than this run" \
+			"sudo $SCRIPTS/tune reset" \
+			"or, if tune is running in another terminal, stop it with Ctrl-C."
+	fi
+
+	TUNED=0
+	untune() {
+		if [ "$TUNED" = 1 ]; then
+			TUNED=0
+			"$SCRIPTS/tune" reset || note "warning: reset failed -- run: sudo $SCRIPTS/tune reset"
+		fi
+	}
+	trap untune EXIT
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 141' PIPE
+	trap 'exit 143' TERM
+
+	failed=0
+	if [ -z "$UNTUNED" ]; then
+		TUNED=1
+		# tune rolls itself back if it fails part-way
+		"$SCRIPTS/tune" keep >/dev/null || { TUNED=0; die "tuning failed"; }
+	fi
+	i=1
+	while [ "$i" -le "$RUNS" ]; do
+		"$SCRIPTS/record" time -n "$NICK" $UNTUNED \
+			${PERIOD:+-c} ${PERIOD:+"$PERIOD"} ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@" ||
+			failed=$((failed + 1))
+		i=$((i + 1))
+	done
+	untune
+
+	if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+		set -- sudo -u "$SUDO_USER" -- "$SCRIPTS/record" count -n "$NICK" ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
+	else
+		set -- "$SCRIPTS/record" count -n "$NICK" ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
+	fi
+	"$@" || failed=$((failed + 1))
+
+	[ "$failed" = 0 ] || die "$failed recording(s) failed; see the failed/ folders"
+}
+
+record_time() {
+	NAME="record time"
+	EVENT=cycles:P
+	PERIOD=100003
+	NICK=
+	MDIR=
+	UNTUNED=0
+	while getopts n:uc:m: opt; do
+		case "$opt" in
+		n) NICK=$OPTARG ;;
+		u) UNTUNED=1 ;;
+		c) PERIOD=$OPTARG ;;
+		m) MDIR=$OPTARG ;;
+		*) usage ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	[ $# -ge 1 ] || usage
+	check_nick "$NICK"
+	check_period "$PERIOD"
+	check_program "$1"
+	shift
+	ARGS="$*"
+	# the kernel keeps only the first 15 characters as the process name
+	COMM=$(printf '%s' "$BASE" | cut -c1-15)
+
+	have perf || die_cmd "perf is not installed" "$(perf_hint)"
+	if [ "$UNTUNED" = 0 ] && ! have systemd-run; then
+		die "systemd-run is missing; it is needed to start the program in tune.slice"
+	fi
+
+	# no power supply entries at all: a desktop
+	ac=desktop
+	for f in /sys/class/power_supply/*/online; do
+		[ -r "$f" ] || continue
+		if [ "$(cat "$f")" = 1 ]; then
+			ac=1
+		elif [ "$ac" = desktop ]; then
+			ac=0
+		fi
+	done
+	[ "$ac" != 0 ] || die "no AC adapter detected -- plug in the power cable; on battery the CPU clock can drop mid-run"
+
+	need_root "perf needs it, and so does starting the program in tune.slice"
+
+	BENCH=
+	if [ "$UNTUNED" = 1 ] && [ -f /run/tune.state ]; then
+		die_cmd "the system is tuned, so -u would run the program on the CPUs left over for everything else" \
+			"sudo $SCRIPTS/tune reset" \
+			"or, if tune is running in another terminal, stop it with Ctrl-C."
+	fi
+	if [ "$UNTUNED" = 0 ]; then
+		if [ ! -f /run/tune.state ]; then
+			die_cmd "the system is not tuned" \
+				"sudo $SCRIPTS/tune hold" \
+				"Run it in another terminal and leave it running, or pass -u
+for an untuned baseline run."
+		fi
+		BENCH=$(systemctl show --property=AllowedCPUs --value tune.slice 2>/dev/null || true)
+		case "$BENCH" in
+		"" | *[!0-9]*)
+			die_cmd "tune.slice allows CPUs '$BENCH', expected exactly one; the tuning is incomplete" \
+				"sudo $SCRIPTS/tune reset" \
+				"then tune again."
+			;;
+		esac
+	fi
+
+	start_run "$MDIR" time "$NICK"
+
+	# A wrapping sh runs the program: it writes the exit status, so that
+	# does not depend on perf's, and snapshots the measured CPU's counters
+	# right before and after (for noise_report), so the noise covers the
+	# program, not perf starting up. The process-name filter below drops
+	# its samples.
+	if [ "$UNTUNED" = 0 ]; then
+		set -- systemd-run --scope --slice=tune --quiet "$PROG" "$@"
+		note "recording $BASE as $RUN on CPU $BENCH"
+	else
+		set -- "$PROG" "$@"
+		note "recording $BASE as $RUN, untuned"
+	fi
+	perf record -e "$EVENT" -c "$PERIOD" --sample-cpu -o "$STAGE/perf.data" -- \
+		sh -c '
+			snapshot() {
+				cat /proc/interrupts >"$2.interrupts"
+				cat /proc/softirqs >"$2.softirqs"
+				grep "^cpu$1 " /proc/stat >"$2.stat"
+				grep "^cpu$1 " /proc/schedstat >"$2.schedstat"
+				t=/sys/devices/system/cpu/cpu$1/thermal_throttle
+				echo "$(cat "$t/core_throttle_count" 2>/dev/null || echo -) $(cat "$t/package_throttle_count" 2>/dev/null || echo -)" >"$2.throttle"
+			}
+			cpu=$1 dir=$2; shift 2
+			[ -z "$cpu" ] || snapshot "$cpu" "$dir/noise.before"
+			"$@" >"$dir/program.out" 2>"$dir/program.err"
+			echo $? >"$dir/status"
+			[ -z "$cpu" ] || snapshot "$cpu" "$dir/noise.after"' \
+		sh "$BENCH" "$STAGE" "$@" \
+		2>"$STAGE/perf-record.log" ||
+		die "perf record failed: $(cat "$STAGE/perf-record.log")"
+	[ -s "$STAGE/status" ] || die "the program did not run to the end; see $STAGE/perf-record.log"
+	status=$(cat "$STAGE/status")
+	rm "$STAGE/status"
+	[ "$status" = 0 ] || program_failed "$status" "the program (or systemd-run)"
+
+	perf script -i "$STAGE/perf.data" --comms "$COMM" -F cpu,time,period \
+		>"$STAGE/check.raw" 2>"$STAGE/perf-script.log" ||
+		die "perf script failed: $(cat "$STAGE/perf-script.log")"
+	# one line per sample: "[cpu] time: period"
+	awk -v bench="$BENCH" '
+		{
+			cpu = $1; gsub(/[^0-9]/, "", cpu); cpu += 0   # "[003]" -> 3
+			t = $2; sub(/:$/, "", t)
+			n++; cycles += $3
+			if (n == 1) first = t
+			last = t
+			if (cpu != bench) off++
+			persec[int(t)] += $3
+		}
+		END {
+			# clock per whole second; the first and last are partial
+			for (k in persec) {
+				if (k + 0 <= int(first) || k + 0 >= int(last)) continue
+				mhz = persec[k] / 1e6
+				if (!secs || mhz < lo) lo = mhz
+				if (!secs || mhz > hi) hi = mhz
+				secs++
+			}
+			printf "%d %d %.6f %.6f %.0f %d %.0f %.0f\n", n, off, first, last, cycles, secs, lo, hi
+		}
+	' "$STAGE/check.raw" >"$STAGE/check"
+	read -r nsamples offcpu first last cycles secs lo hi <"$STAGE/check"
+	rm "$STAGE/check.raw" "$STAGE/check"
+	[ "$nsamples" -gt 0 ] ||
+		die "no samples from a process named $COMM in $STAGE/perf.data"
+	[ "$UNTUNED" = 1 ] || [ "$offcpu" = 0 ] ||
+		die "$offcpu of $nsamples samples ran on other CPUs than $BENCH, so the program was not confined to tune.slice"
+	# perf lists only the record types that occur, as "NAME events: count";
+	# the first list is the total over the whole file.
+	perf report -i "$STAGE/perf.data" --stats >"$STAGE/stats" 2>&1 ||
+		die "perf report --stats failed: $(cat "$STAGE/stats")"
+	awk '$2 == "events:" && !($1 in n) { n[$1] = $3 }
+		END { printf "%d %d %d\n", n["SAMPLE"], n["THROTTLE"], n["LOST"] + n["LOST_SAMPLES"] }
+	' "$STAGE/stats" >"$STAGE/dropped"
+	read -r stat_samples throttled lost <"$STAGE/dropped"
+	rm "$STAGE/dropped"
+	[ "$stat_samples" -gt 0 ] || die "could not read the sample count from perf report --stats"
+	[ "$throttled" = 0 ] && [ "$lost" = 0 ] ||
+		die "perf dropped samples ($throttled throttled, $lost lost), so the counts are incomplete; the kernel's limit is now $(cat /proc/sys/kernel/perf_event_max_sample_rate) samples/s"
+	mhz=$(awk -v c="$cycles" -v a="$first" -v b="$last" \
+		'BEGIN { if (b > a) printf "%.0f", c / (b - a) / 1e6; else print "n/a" }')
+	if [ "$secs" -gt 0 ]; then
+		clock="~$mhz MHz on average, $lo-$hi MHz per whole second ($secs s)"
+		clock_short="$lo-$hi MHz"
+	else
+		clock="~$mhz MHz on average (too short for per-second figures)"
+		clock_short="~$mhz MHz"
+	fi
+
+	"$SCRIPTS/rank" time "$STAGE/perf.data" "$BASE" \
+		>"$STAGE/samples.txt" 2>"$STAGE/rank.log" ||
+		die "ranking failed: $(cat "$STAGE/rank.log")"
+	rm "$STAGE/rank.log"
+	programs=$(awk -v dso="($BASE)" '$NF == dso' "$STAGE/samples.txt" | wc -l)
+	[ "$programs" -gt 0 ] ||
+		die "no samples in $BASE's own code; perf could not match its samples to $PROG"
+	# kernel code shows up as [kernel.kallsyms] or [module]
+	kernel=$(awk '{ t += $2 } $NF ~ /^\(\[/ && $NF != "([unknown])" { k += $2 }
+		END { printf "%.1f", t ? 100 * k / t : 0 }' "$STAGE/samples.txt")
+
+	if [ -n "$BENCH" ]; then
+		noise_report "$BENCH" "$STAGE/noise.before" "$STAGE/noise.after" >"$STAGE/noise.txt"
+		noise="on CPU $BENCH: $(noise_summary "$STAGE/noise.txt")"
+	else
+		noise="untuned"
+	fi
+
+	{
+		meta_common "$ARGS"
+		echo "event:         $EVENT, one sample every $PERIOD cycles"
+		echo "precise_ip:    $(perf evlist -v -i "$STAGE/perf.data" 2>/dev/null | sed -n 's/.*precise_ip: \([0-9]*\).*/\1/p' | head -1)"
+		if [ "$UNTUNED" = 0 ]; then
+			echo "tuned:         yes, CPU $BENCH"
+		else
+			echo "tuned:         no"
+		fi
+		echo "samples:       $nsamples, at $(wc -l <"$STAGE/samples.txt") locations, $programs of them in $BASE"
+		echo "clock:         $clock"
+		echo "kernel:        $kernel% of the samples"
+		if [ -n "$BENCH" ]; then
+			echo "while the program ran, on CPU $BENCH:"
+			sed 's/^/  /' "$STAGE/noise.txt"
+		fi
+		echo ""
+		echo "== perf record"
+		cat "$STAGE/perf-record.log"
+		echo ""
+		echo "== perf report --stats"
+		cat "$STAGE/stats"
+		echo ""
+		echo "== perf evlist -v"
+		perf evlist -v -i "$STAGE/perf.data" 2>&1 || true
+		if [ -x "$SCRIPTS/tune" ]; then
+			echo ""
+			echo "== tune check"
+			"$SCRIPTS/tune" check 2>&1 || true
+		fi
+		meta_output
+	} >"$STAGE/meta.txt"
+	rm -f "$STAGE/perf-record.log" "$STAGE/perf-script.log" "$STAGE/stats" "$STAGE/noise.txt"
+
+	finish_run
+	note "$(shown "$RUN_DIR")/$RUN: $(commas "$nsamples") samples, $clock_short, $kernel% in the kernel; $noise"
+}
+
+record_count() {
+	NAME="record count"
+	NICK=
+	MDIR=
+	while getopts n:m: opt; do
+		case "$opt" in
+		n) NICK=$OPTARG ;;
+		m) MDIR=$OPTARG ;;
+		*) usage ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	[ $# -ge 1 ] || usage
+	check_nick "$NICK"
+	check_program "$1"
+	shift
+	ARGS="$*"
+
+	have valgrind || die_cmd "valgrind is not installed" "$(install_hint valgrind valgrind valgrind)"
+	have python3 || die_cmd "python3 is not installed" "$(install_hint python3 python3 python)"
+	for c in nm objdump readelf; do
+		have "$c" || die_cmd "$c is not installed" "$(install_hint binutils binutils binutils)"
+	done
+
+	start_run "$MDIR" count "$NICK"
+
+	# -v -v -v logs where each file was loaded; the ranking needs that to
+	# name the PLT, init and fini code callgrind leaves unattributed.
+	note "counting $BASE's instructions as $RUN, under callgrind (slow)"
+	status=0
+	valgrind -v -v -v --tool=callgrind --dump-instr=yes \
+		--callgrind-out-file="$STAGE/callgrind.out" --log-file="$STAGE/valgrind.log" \
+		"$PROG" "$@" >"$STAGE/program.out" 2>"$STAGE/program.err" || status=$?
+	[ "$status" = 0 ] || program_failed "$status"
+
+	"$SCRIPTS/rank" count "$STAGE/callgrind.out" "$STAGE/valgrind.log" \
+		>"$STAGE/counts.txt" 2>"$STAGE/rank.log" ||
+		die "ranking failed: $(cat "$STAGE/rank.log")"
+	programs=$(awk -v dso="($BASE)" '$NF == dso' "$STAGE/counts.txt" | wc -l)
+	[ "$programs" -gt 0 ] ||
+		die "no counts for $BASE's own code; the object names in callgrind.out do not match it"
+
+	{
+		meta_common "$ARGS"
+		cat "$STAGE/rank.log"
+		echo "instructions:  $(wc -l <"$STAGE/counts.txt") ran, $programs of them in $BASE"
+		meta_output
+	} >"$STAGE/meta.txt"
+	total=$(sed -n 's/^total Ir: //p' "$STAGE/rank.log")
+	rm "$STAGE/rank.log"
+
+	finish_run
+	note "$(shown "$RUN_DIR")/$RUN: $total instructions ran, at $(commas "$(wc -l <"$RUN_DIR/$RUN.counts.txt")") addresses, $(commas "$programs") of them in $BASE"
+}
+
+case "${1:-}" in
+-h | --help)
+	usage 0
+	;;
+all | time | count)
+	cmd=$1
+	shift
+	"record_$cmd" "$@"
+	;;
+*)
+	usage
+	;;
+esac

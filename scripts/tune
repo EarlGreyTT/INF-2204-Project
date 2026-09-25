@@ -1,43 +1,45 @@
 #!/bin/sh
-# tune.sh -- apply/undo low-noise system tuning for CPU time
-# profiling (perf, etc). POSIX sh only, no bashisms. Run as root.
+# tune -- tune the system for low-noise CPU time profiling (perf), and
+# undo it
 #
 # Usage:
-#   tune.sh [cpu]     dedicate the physical core owning logical
-#                           CPU <cpu> (auto-picked if omitted): offline
-#                           its SMT sibling(s), shield it from the
-#                           scheduler, steer IRQs off it, lock
-#                           frequency, disable ASLR/THP/swap.
-#   tune.sh --reset   undo everything above.
-#   tune.sh --check   report current state, change nothing.
-#   tune.sh --hold [cpu]
-#                           tune, then stay in the foreground until
-#                           Ctrl-C (or SIGTERM), and undo on the way out.
-#                           Profile from a second terminal.
+#   tune hold [<cpu>]
+#   tune keep [<cpu>]
+#   tune reset
+#   tune check
 #
-# Ctrl-C always undoes a partially applied run. --hold extends that to
-# the whole session, so the tuning cannot outlive the terminal by
-# accident; without it the tuning persists until --reset.
+#   hold    tune, then stay in the foreground and restore the system on
+#           Ctrl-C or when the terminal closes; record from another one
+#   keep    tune and exit; the system stays tuned until tune reset
+#   reset   restore the system
+#   check   show the current state, change nothing
+#   <cpu>   the logical CPU to measure on (default: picked automatically)
 #
-# Every step is verified by reading back what was written. A step that
-# does not take effect aborts the run and rolls everything back, rather
-# than reporting success over a system that is not actually tuned.
+# Tuning dedicates the physical core owning the CPU to measuring: takes
+# its SMT sibling(s) offline, shields it from the scheduler, steers IRQs
+# off it, pins the clock, and turns off THP, swap, radios and some
+# background services. reset puts back what was there before.
 #
-# Depends only on util-linux, systemd and coreutils -- no Python, no
-# pipx, no out-of-distro packages.
+# ASLR is left on: with it off every run gets the same memory layout,
+# which may be a lucky or an unlucky one (Mytkowicz et al. 2009); with
+# it on, repeated runs sample different layouts and their spread shows
+# the effect.
 #
+# Every step is read back. One that did not take effect, or Ctrl-C,
+# aborts the run and rolls everything back.
+#
+# Needs only util-linux, systemd and coreutils (no Python or
+# out-of-distro packages).
 # Assumes /sys/devices/system/cpu/present is a contiguous range "0-N".
-# Kernel cmdline isolation (isolcpus=, nohz_full=, rcu_nocbs=) is not
-# set here -- it needs a reboot. Put it in a separate GRUB entry.
+# Boot-time isolation (isolcpus=, nohz_full=, rcu_nocbs=) needs a
+# reboot, so it is only suggested; put it in a separate GRUB entry.
 
 set -eu
 
 STATE=/run/tune.state
 ARMED=0
 
-# perf sampling ceiling to install while tuned. The kernel lowers this
-# on its own if sampling overruns its time budget, so it is set high
-# deliberately and restored on reset.
+# perf's sampling ceiling while tuned (see the sample rate step below)
 SAMPLE_RATE=100000
 
 die() {
@@ -45,8 +47,7 @@ die() {
 	exit 1
 }
 
-# die with a copy-pasteable remedy: the command goes on its own line,
-# flush left, with nothing else on it.
+# die with a fix: the command alone on its own line, to copy-paste
 die_cmd() {
 	echo "tune: error: $1" >&2
 	echo "" >&2
@@ -65,6 +66,24 @@ note() {
 	echo "tune: $1" >&2
 }
 
+# usage [0]: prints the header's Usage block and exits; with 0 (for -h)
+# to stdout, otherwise to stderr as an error
+usage() {
+	if [ "${1:-1}" = 0 ]; then
+		usage_block
+		exit 0
+	fi
+	usage_block >&2
+	exit 1
+}
+
+usage_block() {
+	awk '/^# Usage:/ { p = 1; print "usage:"; next }
+		p && !/^#   / && !/^#$/ { exit }
+		p && /^#$/ { blank++; next }
+		p { while (blank) { print ""; blank-- } sub(/^# /, ""); print }' "$0"
+}
+
 have() {
 	command -v "$1" >/dev/null 2>&1
 }
@@ -72,17 +91,17 @@ have() {
 on_exit() {
 	rc=$?
 	if [ "$rc" -ne 0 ] && [ "$ARMED" = 1 ]; then
-		# leaving --hold on Ctrl-C/SIGTERM is the intended way out, not
-		# a failure, so say so rather than crying abort
+		# leaving a held tuning on Ctrl-C, SIGTERM or a closed terminal
+		# is the intended way out, not a failure
 		case "${HOLD:-0}:$rc" in
-		1:130 | 1:143) echo "tune: restoring system" >&2 ;;
+		1:129 | 1:130 | 1:143) ;;
 		*) echo "tune: aborting, rolling back" >&2 ;;
 		esac
 		ARMED=0
 		if do_reset; then
 			echo "tune: system restored" >&2
 		else
-			echo "tune: rollback FAILED -- run: sudo $0 --reset" >&2
+			echo "tune: rollback FAILED -- run: sudo $0 reset" >&2
 		fi
 	fi
 	exit "$rc"
@@ -147,11 +166,48 @@ thp_current() {
 	sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled
 }
 
+# per-CPU and per-IRQ settings for the state file, as "key:value ..."
+# lists (key: a CPU or IRQ number)
+saved_freqs() {
+	for d in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+		lo=$(cat "$d/scaling_min_freq" 2>/dev/null) || continue
+		hi=$(cat "$d/scaling_max_freq" 2>/dev/null) || continue
+		c=${d%/cpufreq}
+		printf '%s:%s:%s ' "${c##*/cpu}" "$lo" "$hi"
+	done
+}
+
+saved_epps() {
+	for d in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+		p=$(cat "$d/energy_performance_preference" 2>/dev/null) || continue
+		c=${d%/cpufreq}
+		printf '%s:%s ' "${c##*/cpu}" "$p"
+	done
+}
+
+saved_irqs() {
+	for f in /proc/irq/[0-9]*/smp_affinity_list; do
+		a=$(cat "$f" 2>/dev/null) || continue
+		n=${f#/proc/irq/}
+		printf '%s:%s ' "${n%%/*}" "$a"
+	done
+}
+
+# lookup list key: prints the value saved for key in such a list
+lookup() {
+	for kv in $1; do
+		if [ "${kv%%:*}" = "$2" ]; then
+			echo "${kv#*:}"
+			return 0
+		fi
+	done
+	return 1
+}
+
 swap_kb() {
 	awk 'NR>1 {s+=$3} END {print s+0}' /proc/swaps
 }
 
-# write a value, then read it back and confirm it stuck
 set_verify() {
 	path=$1
 	want=$2
@@ -168,8 +224,16 @@ preflight() {
 	done
 
 	if ! have rfkill; then
-		die_cmd "rfkill is not installed (needed to disable radios)" \
-			"sudo apt install rfkill"
+		if have apt-get; then
+			fix="sudo apt install rfkill"
+		elif have dnf; then
+			fix="sudo dnf install util-linux"
+		elif have pacman; then
+			fix="sudo pacman -S util-linux"
+		else
+			fix="(install rfkill with your package manager)"
+		fi
+		die_cmd "rfkill is not installed (needed to disable radios)" "$fix"
 	fi
 
 	if [ ! -d /sys/fs/cgroup/system.slice ]; then
@@ -183,14 +247,15 @@ missing from it, this kernel or boot configuration cannot do cgroup
 CPU shielding at all."
 	fi
 
-	# On a laptop, running on battery lets the firmware drop the CPU
-	# clock when the charge gets low, which silently changes the
-	# cycles-to-wall-time mapping mid-measurement.
-	ac=0
+	# on battery the clock, and so the time per cycle, can change mid-run;
+	# no power supply entries at all: a desktop
+	ac=desktop
 	for f in /sys/class/power_supply/*/online; do
 		[ -r "$f" ] || continue
 		if [ "$(cat "$f")" = 1 ]; then
 			ac=1
+		elif [ "$ac" = desktop ]; then
+			ac=0
 		fi
 	done
 	if [ "$ac" = 0 ]; then
@@ -230,11 +295,21 @@ report() {
 	echo "no_turbo:            $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo n/a)"
 	echo "cpufreq boost:       $(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo n/a)"
 	echo "cpu0 freq floor/ceil: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 2>/dev/null || echo n/a) / $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null || echo n/a)"
+	capped=
+	for d in /sys/devices/system/cpu/cpu*/cpufreq; do
+		[ -r "$d/scaling_max_freq" ] && [ -r "$d/cpuinfo_max_freq" ] || continue
+		if [ "$(cat "$d/scaling_max_freq")" != "$(cat "$d/cpuinfo_max_freq")" ]; then
+			c=${d%/cpufreq}
+			capped="$capped ${c##*/}"
+		fi
+	done
+	echo "ceiling below max:  ${capped:- none}"
 	echo "on AC power:         $(cat /sys/class/power_supply/A*/online 2>/dev/null | head -1 || echo n/a)"
 	echo "ASLR:                $(cat /proc/sys/kernel/randomize_va_space)"
 	echo "THP:                 $(thp_current)"
 	echo "swap in use (KiB):   $(swap_kb)"
 	echo "perf sample rate:    $(cat /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || echo n/a)"
+	echo "perf cpu time limit: $(cat /proc/sys/kernel/perf_cpu_time_max_percent 2>/dev/null || echo n/a) % (0: off)"
 	echo "system.slice cpus:   $(cat /sys/fs/cgroup/system.slice/cpuset.cpus.effective 2>/dev/null || echo n/a)"
 	echo "user.slice cpus:     $(cat /sys/fs/cgroup/user.slice/cpuset.cpus.effective 2>/dev/null || echo n/a)"
 	echo "tuning state file:   $([ -f "$STATE" ] && echo present || echo absent)"
@@ -252,7 +327,13 @@ do_reset() {
 		i=$((i + 1))
 	done
 
+	# empty unless the state file saved them (older ones did not)
+	freqs=
+	epps=
+	irqs=
+	had_state=0
 	if [ -f "$STATE" ]; then
+		had_state=1
 		. "$STATE"
 		if [ "$governor" != unknown ]; then
 			for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
@@ -261,13 +342,23 @@ do_reset() {
 				fi
 			done
 		fi
+		# after the governor: with the performance governor the kernel
+		# refuses any other preference
+		for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+			c=${f%/cpufreq/*}
+			p=$(lookup "$epps" "${c##*/cpu}") && echo "$p" > "$f" 2>/dev/null || true
+		done
 		if [ "$turbo" != unknown ]; then
 			echo "$turbo" > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true
 		fi
 		if [ "${boost:-unknown}" != unknown ]; then
 			echo "$boost" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true
 		fi
-		echo "$aslr" > /proc/sys/kernel/randomize_va_space 2>/dev/null || true
+		# before the sample rate: the kernel refuses that write while
+		# the limit is off
+		if [ "${cputime:-unknown}" != unknown ]; then
+			echo "$cputime" > /proc/sys/kernel/perf_cpu_time_max_percent 2>/dev/null || true
+		fi
 		if [ "$samplerate" != unknown ]; then
 			echo "$samplerate" > /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || true
 		fi
@@ -277,9 +368,27 @@ do_reset() {
 		rm -f "$STATE"
 	fi
 
+	# Restoring turbo does not lift the ceiling of a CPU that was offline
+	# while turbo was off (observed: the SMT sibling stayed at 800 MHz),
+	# so both limits are set back explicitly, after turbo: to the saved
+	# ones, or else the hardware's.
 	for d in /sys/devices/system/cpu/cpu*/cpufreq; do
-		if [ -w "$d/scaling_min_freq" ] && [ -r "$d/cpuinfo_min_freq" ]; then
-			cat "$d/cpuinfo_min_freq" > "$d/scaling_min_freq" 2>/dev/null || true
+		[ -w "$d/scaling_min_freq" ] && [ -w "$d/scaling_max_freq" ] || continue
+		[ -r "$d/cpuinfo_min_freq" ] && [ -r "$d/cpuinfo_max_freq" ] || continue
+		c=${d%/cpufreq}
+		if f=$(lookup "$freqs" "${c##*/cpu}"); then
+			lo=${f%:*}
+			hi=${f#*:}
+		else
+			lo=$(cat "$d/cpuinfo_min_freq")
+			hi=$(cat "$d/cpuinfo_max_freq")
+		fi
+		# the floor down first, so no write crosses the other limit
+		cat "$d/cpuinfo_min_freq" > "$d/scaling_min_freq" 2>/dev/null || true
+		echo "$hi" > "$d/scaling_max_freq" 2>/dev/null || true
+		echo "$lo" > "$d/scaling_min_freq" 2>/dev/null || true
+		if [ "$(cat "$d/scaling_max_freq")" != "$hi" ]; then
+			note "warning: $c is capped at $(cat "$d/scaling_max_freq") kHz, not $hi kHz as before"
 		fi
 	done
 	if [ -n "${defaffinity:-}" ] && [ "${defaffinity:-unknown}" != unknown ]; then
@@ -289,15 +398,44 @@ do_reset() {
 	for u in init.scope system.slice user.slice tune.slice; do
 		systemctl set-property --runtime "$u" AllowedCPUs="0-$max" 2>/dev/null || true
 	done
+	# IRQs registered while tuned have no saved affinity: all CPUs.
+	# Some IRQs refuse any write (the kernel manages their affinity).
 	for f in /proc/irq/[0-9]*/smp_affinity_list; do
-		echo "0-$max" > "$f" 2>/dev/null || true
+		n=${f#/proc/irq/}
+		a=$(lookup "$irqs" "${n%%/*}") || a="0-$max"
+		echo "$a" > "$f" 2>/dev/null || true
 	done
 
-	if have rfkill; then
+	# Radios, swap and services are put back as they were. Without a state
+	# file they may be off by choice (a reset with nothing to undo once
+	# turned Bluetooth on), so they are left alone. An older tune's state
+	# file lacks the lists: then all are turned on.
+	if [ "$had_state" = 0 ]; then
+		note "no saved state ($STATE): radios, swap and services left as they are"
+		return 0
+	fi
+	if [ "${radios-unknown}" != unknown ]; then
+		for id in $radios; do
+			rfkill unblock "$id" 2>/dev/null || true
+		done
+	elif have rfkill; then
 		rfkill unblock all || true
 	fi
-	swapon -a 2>/dev/null || true
-	for svc in irqbalance cron unattended-upgrades; do
+	if [ "${swaps+set}" = set ]; then
+		# not swapon -a: a swap file set up outside /etc/fstab (Raspberry
+		# Pi OS's, say) would stay off
+		for s in $swaps; do
+			swapon "$s" 2>/dev/null || true
+		done
+	else
+		swapon -a 2>/dev/null || true
+	fi
+	if [ "${stopped+set}" = set ]; then
+		svcs=$stopped
+	else
+		svcs="irqbalance cron crond cronie unattended-upgrades"
+	fi
+	for svc in $svcs; do
 		systemctl cat "$svc" >/dev/null 2>&1 && systemctl start "$svc" 2>/dev/null || true
 	done
 }
@@ -318,33 +456,44 @@ auto_select() {
 }
 
 trap on_exit EXIT
+trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-HOLD=0
-if [ $# -ge 1 ] && [ "$1" = "--hold" ]; then
-	HOLD=1
-	shift
-fi
-[ $# -le 1 ] || die "usage: $0 [--hold] [cpu] | --reset | --check"
-
-if [ "$HOLD" = 1 ] && [ $# -eq 1 ]; then
-	case "$1" in
-	--*) die "--hold cannot be combined with $1" ;;
-	esac
-fi
-
-if [ $# -eq 1 ] && [ "$1" = "--check" ]; then
+case "${1:-}" in
+-h | --help)
+	usage 0
+	;;
+check)
+	[ $# -eq 1 ] || usage
 	[ "$(id -u)" = 0 ] || die "must run as root"
 	report
 	exit 0
-fi
-
-if [ $# -eq 1 ] && [ "$1" = "--reset" ]; then
+	;;
+reset)
+	[ $# -eq 1 ] || usage
 	[ "$(id -u)" = 0 ] || die "must run as root"
 	do_reset
-	note "reset done"
+	note "system restored"
 	exit 0
+	;;
+hold)
+	HOLD=1
+	shift
+	;;
+keep)
+	HOLD=0
+	shift
+	;;
+*)
+	usage
+	;;
+esac
+[ $# -le 1 ] || usage
+if [ $# -eq 1 ]; then
+	case "$1" in
+	"" | *[!0-9]*) usage ;;
+	esac
 fi
 
 preflight
@@ -357,19 +506,17 @@ while [ "$i" -le "$MAX" ]; do
 	f="/sys/devices/system/cpu/cpu$i/online"
 	if [ -f "$f" ] && [ "$(cat "$f")" = 0 ]; then
 		die_cmd "cpu $i is already offline, so a previous run did not finish" \
-			"sudo $0 --reset"
+			"sudo $0 reset"
 	fi
 	i=$((i + 1))
 done
 if [ -f "$STATE" ]; then
 	die_cmd "$STATE exists: the system is already tuned, or a previous run left state behind" \
-		"sudo $0 --reset"
+		"sudo $0 reset"
 fi
 
+AUTO=
 if [ $# -eq 1 ]; then
-	case "$1" in
-	*[!0-9]*) die "cpu must be a plain number, got '$1'" ;;
-	esac
 	BENCH=$1
 	[ "$BENCH" -le "$MAX" ] || die "cpu $BENCH does not exist (max is $MAX)"
 	if [ "$BENCH" = 0 ]; then
@@ -377,33 +524,44 @@ if [ $# -eq 1 ]; then
 	fi
 else
 	BENCH=$(auto_select "$MAX")
-	note "auto-selected CPU $BENCH"
+	AUTO=", auto-selected"
 fi
 
+# radios that are on now, and the swap in use, to restore exactly those
+# (an rfkill too old for -o gives unknown: reset then unblocks all)
+if rfkill -n -o ID,SOFT >/dev/null 2>&1; then
+	radios=$(rfkill -n -o ID,SOFT | awk '$2 == "unblocked" { printf "%s ", $1 }')
+else
+	radios=unknown
+fi
 {
+	echo "radios='$radios'"
+	echo "swaps='$(awk 'NR > 1 { printf "%s ", $1 }' /proc/swaps)'"
 	echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
 	echo "turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo unknown)"
 	echo "boost=$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo unknown)"
-	echo "aslr=$(cat /proc/sys/kernel/randomize_va_space)"
 	echo "samplerate=$(cat /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || echo unknown)"
+	echo "cputime=$(cat /proc/sys/kernel/perf_cpu_time_max_percent 2>/dev/null || echo unknown)"
 	echo "thp=$(thp_current)"
 	echo "defaffinity=$(cat /proc/irq/default_smp_affinity 2>/dev/null || echo unknown)"
+	echo "freqs='$(saved_freqs)'"
+	echo "epps='$(saved_epps)'"
+	echo "irqs='$(saved_irqs)'"
+	# appended to below for each service stopped
+	echo "stopped=''"
 } > "$STATE"
 ARMED=1
 
-note "blocking radios"
 rfkill block all || die "rfkill block failed"
 
-note "setting governor and turbo"
 for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
 	[ -w "$f" ] || continue
 	set_verify "$f" performance
 done
-# Turbo/boost is disabled before the ceiling is read below, so the clock
-# gets pinned at the highest non-boost frequency. That is the only one
-# the vendor guarantees can be sustained; any boost frequency may be
-# dropped mid-run by thermal or power limits. Intel exposes the knob as
-# intel_pstate/no_turbo, acpi-cpufreq and amd-pstate as cpufreq/boost.
+# Turbo off before the ceiling is read below, so the clock is pinned at
+# the highest non-boost frequency: the only one the vendor guarantees
+# can be sustained; thermal or power limits may drop a boost one mid-run.
+# intel_pstate has no_turbo, acpi-cpufreq and amd-pstate cpufreq/boost.
 if [ -w /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
 	set_verify /sys/devices/system/cpu/intel_pstate/no_turbo 1
 elif [ -w /sys/devices/system/cpu/cpufreq/boost ]; then
@@ -412,12 +570,9 @@ else
 	note "warning: no turbo/boost knob found; the pinned clock below may be one the CPU cannot sustain"
 fi
 
-# The governor alone only removes the scheduler's *preference* for lower
-# clocks; the floor is still the hardware minimum. Raising
-# scaling_min_freq to the maximum is what actually pins the clock, which
-# is what keeps a perf cycle sample worth the same wall-clock time at the
-# end of a recording as at the start.
-note "pinning CPU frequency floor to its ceiling"
+# The governor alone leaves the floor at the hardware minimum. Raising
+# scaling_min_freq to the maximum pins the clock, so a perf cycle sample
+# is worth the same time at the end of a recording as at the start.
 for d in /sys/devices/system/cpu/cpu*/cpufreq; do
 	[ -w "$d/scaling_min_freq" ] || continue
 	maxf=$(cat "$d/scaling_max_freq")
@@ -425,37 +580,40 @@ for d in /sys/devices/system/cpu/cpu*/cpufreq; do
 done
 PINNED=$(cat "/sys/devices/system/cpu/cpu$BENCH/cpufreq/scaling_max_freq" 2>/dev/null || echo unknown)
 
-note "disabling ASLR and THP"
-set_verify /proc/sys/kernel/randomize_va_space 0
 echo never > /sys/kernel/mm/transparent_hugepage/enabled || die "cannot disable THP"
 [ "$(thp_current)" = never ] || die "THP is still $(thp_current) after write"
 
 used=$(swap_kb)
 if [ "$used" -gt 0 ]; then
-	note "disabling swap (${used} KiB in use -- this blocks until it is paged back in)"
-else
-	note "disabling swap (nothing in use)"
+	note "turning swap off (${used} KiB in use; this blocks until it is paged back in)"
 fi
 swapoff -a || die "swapoff failed"
 [ "$(swap_kb)" = 0 ] || die "swap still in use after swapoff"
 
-note "stopping background services"
-for svc in irqbalance cron unattended-upgrades; do
-	if systemctl cat "$svc" >/dev/null 2>&1; then
+# only those running, so reset starts exactly those again; cron's unit
+# is cron on Debian and Ubuntu, crond on Fedora, cronie on Arch
+STOPPED=
+stopped=
+for svc in irqbalance cron crond cronie unattended-upgrades; do
+	if systemctl is-active --quiet "$svc" 2>/dev/null; then
 		systemctl stop "$svc" || die "could not stop $svc"
+		STOPPED="$STOPPED${STOPPED:+, }$svc"
+		stopped="$stopped $svc"
+		echo "stopped='$stopped'" >>"$STATE"
 	fi
 done
 
-# offline the SMT sibling(s) only after the governor pass above: taking a
-# CPU down first leaves its cpufreq policy in a state that faults later
-# writes (observed as "echo: I/O error").
-note "offlining SMT sibling(s) of CPU $BENCH"
+# SMT sibling(s) offline only after the governor pass above: taking a
+# CPU down first makes later cpufreq writes fail (observed: "echo: I/O
+# error").
+OFFLINED=
 siblist=$(cat "/sys/devices/system/cpu/cpu$BENCH/topology/thread_siblings_list" 2>/dev/null || echo "$BENCH")
 for s in $(expand_cpulist "$siblist"); do
 	if [ "$s" = "$BENCH" ]; then
 		continue
 	fi
 	set_verify "/sys/devices/system/cpu/cpu$s/online" 0
+	OFFLINED="$OFFLINED${OFFLINED:+, }$s"
 done
 
 REMAINING=""
@@ -472,7 +630,6 @@ done
 REMAINING=${REMAINING#,}
 [ -n "$REMAINING" ] || die "no CPUs left to host the system"
 
-note "steering IRQs off CPU $BENCH"
 moved=0
 for f in /proc/irq/[0-9]*/smp_affinity_list; do
 	echo "$REMAINING" > "$f" 2>/dev/null && moved=$((moved + 1)) || true
@@ -485,25 +642,21 @@ if [ -w /proc/irq/default_smp_affinity ]; then
 	echo "$mask" > /proc/irq/default_smp_affinity ||
 		die "could not set default_smp_affinity to $mask"
 fi
-note "  $moved IRQ(s) re-steered (some are pinned by the kernel and cannot move)"
 
 # cgroup-v2-native shielding. cset is not an option: it only speaks
 # cgroup v1, which Ubuntu dropped in 21.10.
-note "shielding CPU $BENCH (AllowedCPUs=$REMAINING)"
 for u in init.scope system.slice user.slice; do
 	systemctl set-property --runtime "$u" AllowedCPUs="$REMAINING" ||
 		die "systemctl set-property failed on $u"
 done
 
 # The isolated CPU needs a slice of its own, or nothing can run on it:
-# every ordinary process lives under user.slice or system.slice, which
-# were just restricted to the other CPUs. Workloads are started in it
-# with "systemd-run --scope --slice=tune".
+# user.slice and system.slice were just restricted to the other CPUs.
+# Programs run in it with "systemd-run --scope --slice=tune".
 systemctl set-property --runtime tune.slice AllowedCPUs="$BENCH" ||
 	die "could not create tune.slice for CPU $BENCH"
 
-# verify the shielding actually constrains the cgroups, rather than just
-# having been accepted by systemd
+# check the shielding took effect, not just that systemd accepted it
 want=$(cpulist_norm "$REMAINING")
 for c in system.slice user.slice; do
 	f="/sys/fs/cgroup/$c/cpuset.cpus.effective"
@@ -513,50 +666,72 @@ for c in system.slice user.slice; do
 		die "shielding did not take effect: $c has cpus '$(cat "$f")', expected '$REMAINING'"
 done
 
-# Everything pyperf's "system tune" would do here (ASLR, governor, turbo,
-# IRQ affinity) is already done and verified above, and the one remaining
-# thing it changes -- dropping perf_event_max_sample_rate to 1 -- would
-# throttle the very perf record this machine is being tuned for. So the
-# sample rate is raised here instead, and pyperf is not a dependency.
-note "raising perf sample rate ceiling"
+# The rest of what pyperf's "system tune" does (governor, turbo, IRQ
+# affinity) is done above; it also drops perf_event_max_sample_rate to
+# 1, which would throttle perf record, so the rate is raised instead.
 if [ -w /proc/sys/kernel/perf_event_max_sample_rate ]; then
-	set_verify /proc/sys/kernel/perf_event_max_sample_rate "$SAMPLE_RATE"
+	# The kernel lowers the ceiling by itself whenever perf's interrupts
+	# exceed its CPU time limit, as they do at a low clock ("perf:
+	# interrupt took too long" in the kernel log), and then drops
+	# samples. Turning the limit off keeps the ceiling; perf spends the
+	# same time per sample either way. The ceiling can only be written
+	# while the limit is on, and the kernel may lower it in between, so
+	# the pair is retried.
+	rate=/proc/sys/kernel/perf_event_max_sample_rate
+	limit=/proc/sys/kernel/perf_cpu_time_max_percent
+	[ -w "$limit" ] || die "cannot write $limit, so perf would get throttled at this clock"
+	try=0
+	while :; do
+		echo 25 >"$limit" && echo "$SAMPLE_RATE" >"$rate" && echo 0 >"$limit" ||
+			die "cannot write $rate and $limit"
+		[ "$(cat "$rate")" = "$SAMPLE_RATE" ] && break
+		try=$((try + 1))
+		[ "$try" -lt 5 ] || die "the kernel kept lowering $rate below $SAMPLE_RATE"
+	done
+	[ "$(cat "$limit")" = 0 ] || die "$limit reads back as '$(cat "$limit")', expected '0'"
 else
 	note "warning: perf_event_max_sample_rate not writable; left as-is"
 fi
 
-# nohz_full is deliberately not advised when intel_pstate is the driver:
-# preflight refuses that combination outright (RH bug 1378529), so
-# suggesting it here would contradict the check above.
+# not nohz_full with intel_pstate: preflight refuses that combination
 params="isolcpus rcu_nocbs"
 if [ ! -d /sys/devices/system/cpu/intel_pstate ]; then
 	params="$params nohz_full"
 fi
+missing=
 for p in $params; do
 	case " $(cat /proc/cmdline) " in
 	*" $p="*) ;;
-	*) note "note: $p= absent from kernel cmdline (needs a reboot for full isolation)" ;;
+	*) missing="$missing $p=$BENCH" ;;
 	esac
 done
-if [ -d /sys/devices/system/cpu/intel_pstate ]; then
-	note "note: nohz_full is not advised here -- it is incompatible with the intel_pstate driver this CPU uses"
-fi
 
-note "CPU $BENCH tuned and verified, clock pinned at $PINNED kHz"
-note "run workloads on it inside tune.slice, e.g."
-note ""
-note "sudo systemd-run --scope --slice=tune --quiet perf record -e cycles:P -c 100003 -- ./program"
-note ""
+case "$PINNED" in
+*[!0-9]* | "") clock="$PINNED kHz" ;;
+*) clock="$((PINNED / 1000)) MHz" ;;
+esac
+note "isolated CPU $BENCH$AUTO (${OFFLINED:+SMT sibling $OFFLINED offline, }$moved IRQs moved off it), clock pinned at $clock"
+note "until restored: radios, THP and swap are off${STOPPED:+; $STOPPED stopped}"
+if [ -n "$missing" ]; then
+	if [ -d /sys/devices/system/cpu/intel_pstate ]; then
+		note "for full isolation, also boot with$missing (nohz_full is left out: with intel_pstate it makes the clock unstable)"
+	else
+		note "for full isolation, also boot with$missing"
+	fi
+fi
 
 if [ "$HOLD" = 1 ]; then
 	# ARMED stays set: Ctrl-C/SIGTERM raises a non-zero exit, and the
 	# EXIT trap undoes everything on the way out.
 	echo "$BENCH"
-	note "holding CPU $BENCH -- profile from another terminal"
-	note "press Ctrl-C here when done; the system will be restored"
-	# short sleeps on purpose: a shell only runs a pending trap once the
-	# current foreground command finishes, so a long sleep would delay
-	# the rollback by however long remains of it.
+	note "holding; record from another terminal, e.g.:"
+	note ""
+	note "sudo $(dirname "$0")/record time -n <nick> <program>"
+	note ""
+	note "press Ctrl-C here when done, to restore the system"
+	note "(closing this terminal restores it too)"
+	# short sleeps: a pending trap runs only once the foreground command
+	# finishes, so a long sleep would delay the rollback
 	while :; do
 		sleep 1
 	done

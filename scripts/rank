@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""rank -- rank a run's instructions by how often they were sampled
+(perf) or ran (callgrind), or show one function's instructions
+
+Usage:
+  rank time [-a <function> [-b <binary>]] <perf-data> <program-name>
+  rank count [-a <function> [-b <binary>]] <callgrind-output> <valgrind-log>
+
+  time    the samples in <perf-data> (perf record's output) of the
+          process named <program-name>
+  count   the execution counts (Ir) in <callgrind-output> (recorded with
+          --dump-instr=yes); <valgrind-log> is the same run's log from
+          valgrind -v -v -v, for the load addresses
+  -a      instead of the ranking: <function>'s disassembly, each
+          instruction with its samples or count
+  -b      disassemble <binary>, a stored copy of the program (e.g.
+          measurements/<program>/binaries/<hash>), instead of the file
+          at the recorded path, which the next build overwrites
+
+Prints "rank count location (dso)", most first, ties ordered by
+location so the ranks are the same every time. Locations are named
+sym+0xoff the way perf names them.
+
+record calls this after each run. Rerun later, it gives the same
+names only while the program, libc and their debug symbols are the
+recorded versions: perf.data and callgrind.out store addresses. -a
+checks a time run's binary by its build-id; a count run stores none,
+so there -a only checks that the counts fall on instruction starts.
+"""
+import bisect
+import getopt
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+from collections import Counter
+
+
+def die(msg):
+    sys.exit(f"rank: error: {msg}")
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    except subprocess.CalledProcessError as e:
+        die(f"{' '.join(map(os.fsdecode, cmd[:2]))} failed: {e.stderr.strip()}")
+
+
+# -- time (perf) --
+
+def perf_script(data, comm, fields):
+    # the kernel keeps only the first 15 bytes as the process name
+    return run("perf", "script", "-i", data, "--comms", os.fsencode(comm)[:15],
+               "-G", "-F", fields).splitlines()
+
+
+def rank_time(data, comm):
+    """{"sym+off (dso)": samples}, named by perf."""
+    loc = Counter()
+    for l in perf_script(data, comm, "ip,sym,symoff,dso"):
+        # "ip sym+off (/path/dso)" -> "sym+off (dso)"
+        l = re.sub(r"^[ \t]*[0-9a-f]+[ \t]+", "", l)
+        m = re.search(r" \([^()]*\)$", l)
+        if not m:
+            die(f"could not parse perf script output: {l}")
+        loc[f"{l[:m.start()]} ({m[0][2:-1].rsplit('/', 1)[-1]})"] += 1
+    return loc
+
+
+def time_addresses(data, comm):
+    """{object path: Counter(address)} for the samples in files, by the
+    addresses in those files."""
+    offs = {}
+    for l in perf_script(data, comm, "ip,dso,dsoff"):
+        # "ip (/path/dso+0xoff)", the offset into the file
+        m = re.search(r"\(([^()]*)\)$", l)
+        if not m:
+            die(f"could not parse perf script output: {l}")
+        if m[1].startswith("["):
+            continue  # the kernel, or no file
+        path, _, off = m[1].rpartition("+0x")
+        offs.setdefault(path, Counter())[int(off, 16)] += 1
+    return offs
+
+
+def file_to_address(path, offs):
+    """Maps file offsets to addresses with the ELF's loadable segments."""
+    segs = []
+    for l in run("readelf", "-l", "-W", path).splitlines():
+        f = l.split()
+        if f and f[0] == "LOAD":
+            segs.append((int(f[1], 16), int(f[2], 16), int(f[4], 16)))
+    out = Counter()
+    for off, n in offs.items():
+        seg = next((s for s in segs if s[0] <= off < s[0] + s[2]), None)
+        if not seg:
+            die(f"{path}: offset {off:#x} is in no loadable segment")
+        out[off - seg[0] + seg[1]] += n
+    return out
+
+
+def build_id(path):
+    m = re.search(r"Build ID: ([0-9a-f]+)", run("readelf", "-n", path))
+    return m and m[1]
+
+
+# -- count (callgrind) --
+
+def decode(path):
+    """Returns {(object path, address): Ir}, checked against the file's total."""
+    names = {}       # callgrind shortens repeated object paths to "(id)"
+    ob = None        # object the current cost lines belong to
+    pos = None       # last position; most are written relative to it
+    instr = ir_col = None
+    skip = False     # the cost line after calls= is the callee's total, not ours
+    total = None
+    ir = Counter()
+    with open(path) as f:
+        lines = f.readlines()
+    for l in lines:
+        if l[0] in "0123456789+-*":
+            if pos is None or ir_col is None:
+                die(f"{path}: cost line before the positions:/events: header")
+            tok = l.split()
+            for i, t in enumerate(tok[:len(pos)]):
+                if t != "*":
+                    pos[i] = pos[i] + int(t, 0) if t[0] in "+-" else int(t, 0)
+            col = len(pos) + ir_col
+            if not skip and len(tok) > col:
+                ir[(ob, pos[instr])] += int(tok[col])
+            skip = False
+        elif m := re.match(r"(c?)ob=(?:\((\d+)\))? ?(.*)", l.rstrip("\n")):
+            callee, id, name = m.groups()
+            if name:
+                names[id] = name
+            if not callee:
+                ob = name or names[id]
+        elif l.startswith("calls="):
+            skip = True
+        elif l.startswith(("jump=", "jcnd=")):
+            die(f"{path}: has jump data; record without --collect-jumps")
+        elif l.startswith("positions:"):
+            kinds = l.split()[1:]
+            if "instr" not in kinds:
+                die(f"{path}: no instruction addresses; record with --dump-instr=yes")
+            instr = kinds.index("instr")
+            pos = [0] * len(kinds)
+        elif l.startswith("events:"):
+            events = l.split()[1:]
+            if "Ir" not in events:
+                die(f"{path}: no Ir event")
+            ir_col = events.index("Ir")
+        elif l.startswith(("summary:", "totals:")):
+            total = int(l.split()[1 + ir_col])
+    if pos is None:
+        die(f"{path}: no instruction addresses; record with --dump-instr=yes")
+    if total != sum(ir.values()):
+        die(f"{path}: decoded {sum(ir.values())} Ir but the file's total is {total}")
+    return ir
+
+
+def load_offsets(log):
+    """{object path: load offset} from a valgrind -v -v -v log, which
+    includes valgrind's own files."""
+    offsets, path = {}, None
+    with open(log) as f:
+        lines = f.readlines()
+    for l in lines:
+        if m := re.search(r"Reading syms from (.+)$", l):
+            path = m[1].strip()
+        elif path and (m := re.search(r"svma (0x[0-9a-f]+), avma (0x[0-9a-f]+)", l)):
+            offsets[path] = int(m[2], 16) - int(m[1], 16)
+            path = None
+    if not offsets:
+        die(f"{log}: no load addresses; run valgrind with -v -v -v")
+    return offsets
+
+
+def count_addresses(out, log):
+    """({(object path or None, address): Ir}, total Ir, Ir left out as
+    valgrind's own code)."""
+    ir = decode(out)
+    # Callgrind attributes only .text to its object. PLT, init and fini
+    # code show up under "???" at run-time addresses; map them back.
+    offsets = load_offsets(log)
+    tools = [p for p in offsets if os.path.basename(p).startswith("callgrind-")]
+    if not tools:
+        die(f"{log}: valgrind's own files not listed; is it a callgrind log?")
+    tooldir = os.path.dirname(tools[0])
+    ranges = [(p, off, s, e) for p, off in offsets.items() if os.path.exists(p)
+              for _, s, e in code_sections(p)]
+    counts, skipped = Counter(), 0
+    for (ob, a), n in ir.items():
+        if ob == "???":
+            ob = None
+            for p, off, s, e in ranges:
+                if s <= a - off < e:
+                    ob, a = p, a - off
+                    break
+        if ob and os.path.dirname(ob) == tooldir:
+            skipped += n  # valgrind's own code, absent from a native run
+        else:
+            counts[(ob, a)] += n
+    return counts, sum(ir.values()), skipped
+
+
+def rank_count(out, log):
+    counts, total, skipped = count_addresses(out, log)
+    syms, loc = {}, Counter()
+    for (ob, a), n in counts.items():
+        name = "[unknown]"
+        if ob:
+            if ob not in syms:
+                syms[ob] = symbols(ob)
+            table = syms[ob]
+            i = bisect.bisect_right(table, (a, float("inf"))) - 1
+            if i >= 0 and a < table[i][1]:
+                name = f"{table[i][2]}+{a - table[i][0]:#x}"
+        loc[f"{name} ({os.path.basename(ob) if ob else '[unknown]'})"] += n
+    print(f"total Ir: {total:,}", file=sys.stderr)
+    print(f"valgrind's own code, left out: {skipped:,} Ir", file=sys.stderr)
+    return loc
+
+
+# -- ELF files --
+
+def symbols(path):
+    """Sorted (start, end, name) for the code in an ELF file."""
+    src = [path]
+    if " .symtab " not in run("readelf", "-S", "-W", path):
+        # separate debug symbols: installed by the distribution (Debian,
+        # Ubuntu, Fedora), or fetched by a debuginfod client (Arch)
+        bid = build_id(path)
+        cache = os.environ.get("DEBUGINFOD_CACHE_PATH",
+                               os.path.expanduser("~/.cache/debuginfod_client"))
+        found = [d for d in (bid and [f"/usr/lib/debug/.build-id/{bid[:2]}/{bid[2:]}.debug",
+                                      f"{cache}/{bid}/debuginfo"] or [])
+                 if os.path.exists(d)]
+        if found:
+            src = [found[0]]
+        else:
+            print(f"warning: no symbol table for {path}; using exported names only",
+                  file=sys.stderr)
+            src = ["-D", path]
+    best = {}  # start -> (preference, size, name)
+    for l in run("nm", "-S", "--defined-only", *src).splitlines():
+        f = l.split()
+        if len(f) == 3:
+            f.insert(1, "0")
+        if len(f) != 4 or f[2] not in "TtWwi":
+            continue
+        start, size, kind, name = int(f[0], 16), int(f[1], 16), f[2], f[3]
+        # Of several names for one address, pick the one perf shows:
+        # sized, strong over weak, global over local, fewest leading
+        # underscores, longest.
+        pref = (size > 0, kind not in "Ww", kind.isupper() or kind == "i",
+                len(name.lstrip("_")) - len(name), len(name))
+        if start not in best or pref > best[start][0]:
+            best[start] = (pref, size, name)
+    # PLT stubs have no symbols; perf names them after objdump's labels.
+    plt = [s for s in code_sections(path) if "plt" in s[0]]
+    if plt:
+        args = [a for s in plt for a in ("-j", s[0])]
+        dis = run("objdump", "-d", *args, path)
+        for a, name in re.findall(r"^([0-9a-f]+) <(.+)>:$", dis, re.M):
+            best.setdefault(int(a, 16), (None, 0, name))
+    starts = sorted(best)
+    return [(s, s + best[s][1] if best[s][1] else
+             (starts[i + 1] if i + 1 < len(starts) else s + 1), best[s][2])
+            for i, s in enumerate(starts)]
+
+
+def code_sections(path):
+    """(name, start, end) of each executable section."""
+    out = []
+    for l in run("objdump", "-h", "-w", path).splitlines():
+        f = l.split()
+        if len(f) > 6 and f[0].isdigit() and "CODE" in l:
+            start = int(f[3], 16)
+            out.append((f[1], start, start + int(f[2], 16)))
+    return out
+
+
+# -- one function (-a) --
+
+def time_objects(data, comm, binary):
+    """([(recorded path, file to read, Counter(address))], [paths whose
+    file changed since the run]), checked by build-id."""
+    offs = time_addresses(data, comm)
+    ids = {}
+    for l in run("perf", "buildid-list", "-i", data).splitlines():
+        bid, _, path = l.partition(" ")
+        ids[path] = bid
+    if binary:
+        bid = build_id(binary)
+        path = next((p for p in offs if ids.get(p) == bid), None)
+        if not path:
+            die(f"{binary} is not a file with samples in {data} (build-id {bid})")
+        return [(path, binary, file_to_address(binary, offs[path]))], []
+    objs, stale = [], []
+    for path, o in offs.items():
+        if os.path.exists(path) and build_id(path) == ids.get(path):
+            objs.append((path, path, file_to_address(path, o)))
+        else:
+            stale.append(path)
+    return objs, stale
+
+
+def count_objects(out, log, binary):
+    """[(recorded path, file to read, Counter(address))]."""
+    counts, _, _ = count_addresses(out, log)
+    addrs = {}
+    for (ob, a), n in counts.items():
+        if ob:
+            addrs.setdefault(ob, Counter())[a] += n
+    if binary:
+        with open(out) as f:
+            cmd = next((l.split()[1] for l in f if l.startswith("cmd:")), None)
+        if cmd not in addrs:
+            die(f"{out}: no counts for the program ({cmd})")
+        return [(cmd, binary, addrs[cmd])], []
+    return [(ob, ob, a) for ob, a in addrs.items() if os.path.exists(ob)], []
+
+
+def show_function(func, objs, stale, unit, fix):
+    """fix: the command to rerun with a copy of the program."""
+    found = [(path, file, a, s, e) for path, file, a in objs
+             for s, e, name in symbols(file) if name == func]
+    if not found:
+        msg = (f"no function {func} in the files with {unit} ("
+               + ", ".join(os.path.basename(p) for p, _, _ in objs) + ")")
+        if stale:
+            msg += ("; changed since the run (build-id differs): "
+                    + ", ".join(stale) + "; if it is in the program, use its stored copy"
+                    + " (binaries/<hash>, named in the run's meta.txt):\n" + fix)
+        die(msg)
+    if len(found) > 1:
+        die(f"several functions named {func}: "
+            + ", ".join(f"{os.path.basename(p)} at {s:#x}" for p, _, _, s, _ in found))
+    path, file, addrs, start, end = found[0]
+    dis = run("objdump", "-d", "--no-show-raw-insn", f"--start-address={start:#x}",
+              f"--stop-address={end:#x}", file)
+    insns = [(int(a, 16), text) for a, text in re.findall(r"^\s+([0-9a-f]+):\s+(.*)$", dis, re.M)]
+    stray = {a for a in addrs if start <= a < end} - {a for a, _ in insns}
+    if stray:
+        die(f"{len(stray)} of the addresses with {unit} in {func} are not instruction "
+            f"starts in {file}: not the build that ran; use the program's stored copy "
+            f"(binaries/<hash>, named in the run's meta.txt):\n{fix}")
+    print(f"{func} ({os.path.basename(path)}): {sum(addrs[a] for a, _ in insns):,} {unit}")
+    for a, text in insns:
+        count = f"{addrs[a]:,}" if a in addrs else "."
+        print(f"{count:>14}  {func}+{a - start:<#6x} {text}")
+
+
+def usage(status=1):
+    """Prints the docstring's Usage block and exits; with 0 (for -h) to
+    stdout, otherwise to stderr."""
+    lines = __doc__.split("\n")
+    block = []
+    for line in lines[lines.index("Usage:") + 1:]:
+        if line and not line.startswith("  "):
+            break
+        block.append(line)
+    text = "usage:\n" + "\n".join(block).rstrip() + "\n"
+    (sys.stdout if status == 0 else sys.stderr).write(text)
+    sys.exit(status)
+
+
+def main(argv):
+    if len(argv) == 1 and argv[0] in ("-h", "--help"):
+        usage(0)
+    if not argv or argv[0] not in ("time", "count"):
+        usage()
+    try:
+        opts, args = getopt.getopt(argv[1:], "a:b:")
+    except getopt.GetoptError:
+        usage()
+    opts = dict(opts)
+    if len(args) != 2 or ("-b" in opts and "-a" not in opts):
+        usage()
+    mode, (a, b), func, binary = argv[0], args, opts.get("-a"), opts.get("-b")
+
+    if func:
+        q = shlex.quote
+        fix = f"{q(sys.argv[0])} {mode} -a {q(func)} -b <binary> {q(a)} {q(b)}"
+        if mode == "time":
+            show_function(func, *time_objects(a, b, binary), "samples", fix)
+        else:
+            show_function(func, *count_objects(a, b, binary), "Ir", fix)
+        return
+    loc = rank_time(a, b) if mode == "time" else rank_count(a, b)
+    if not loc:
+        die(f"nothing to rank in {a}")
+    for i, (l, n) in enumerate(sorted(loc.items(), key=lambda x: (-x[1], x[0])), 1):
+        print(i, n, l)
+
+
+# die quietly, like a shell script, when stdout closes early or on Ctrl-C
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+try:
+    main(sys.argv[1:])
+except OSError as e:
+    die(f"{e.filename}: {e.strerror}")

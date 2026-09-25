@@ -1,10 +1,9 @@
-# raw profiling data and compiled binaries (regenerable, large)
+# recorded data (scripts/record), and stray perf output
+measurements/
 perf.data*
 perf.zip
-measurements/*/program
-measurements/*/quicksort
 
-# LaTeX build output
+# compiled programs (make), and LaTeX build output
 build/
 *.aux
 *.bbl
