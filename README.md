@@ -39,3 +39,19 @@ script explains itself with `-h`.
 | `rank` | Ranks a recording's instructions, or shows one function's. |
 
 If a tuned system is ever left tuned, run `sudo scripts/tune reset`.
+
+### Graphing
+Takes in a path to a csv file with the format
+
+| rank | count | function | offset | file |
+
+
+Make the file exacutable
+```sh
+chmod +x graphing
+```
+
+Run the script
+```sh
+./graphing <path> <title (optional)>
+```
