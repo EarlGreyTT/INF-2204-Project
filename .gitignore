@@ -13,3 +13,6 @@ build/
 *.log
 *.out
 *.synctex.gz
+
+# meta data files
+.DS_store
