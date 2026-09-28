@@ -44,9 +44,9 @@ If a tuned system is ever left tuned, run `sudo scripts/tune reset`.
 Takes in a path to a csv file with the format
 
 | rank | count | function | offset | file |
+|---|---|---|---|---|
 
-
-Make the file exacutable
+Make the file executable
 ```sh
 chmod +x graphing
 ```
