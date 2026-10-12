@@ -29,14 +29,22 @@
 # it on, repeated runs sample different layouts and their spread shows
 # the effect.
 #
-# Every step is read back. One that did not take effect, or Ctrl-C,
-# aborts the run and rolls everything back.
+# After every change tune checks that it took effect. If one did not, or
+# on Ctrl-C, tune stops and undoes what it did. reset checks too: if a
+# radio, a swap device or a service did not come back, it names it and
+# exits with an error; run it again.
+#
+# The radios come back on by themselves an hour after tuning, even if
+# this script is killed or never reset: a machine reached only over
+# Wi-Fi (a Raspberry Pi over ssh, say) would otherwise stay out of
+# reach. Over such a connection the session freezes while they are off,
+# so run tune and record inside screen or tmux there.
 #
 # Needs only util-linux, systemd and coreutils (no Python or
 # out-of-distro packages).
 # Assumes /sys/devices/system/cpu/present is a contiguous range "0-N".
 # Boot-time isolation (isolcpus=, nohz_full=, rcu_nocbs=) needs a
-# reboot, so it is only suggested; put it in a separate GRUB entry.
+# reboot, so it is only suggested; put it in a separate boot entry.
 
 set -eu
 
@@ -45,6 +53,10 @@ ARMED=0
 
 # perf's sampling ceiling while tuned (see the sample rate step below)
 SAMPLE_RATE=100000
+
+# seconds until the radios are turned back on regardless (see
+# guard_radios); longer than any tuned session should take
+RADIO_LIMIT=3600
 
 die() {
 	echo "tune: error: $1" >&2
@@ -94,6 +106,9 @@ have() {
 
 on_exit() {
 	rc=$?
+	# from here on nothing may stop the undoing, not even a message that
+	# cannot be printed
+	set +e
 	if [ "$rc" -ne 0 ] && [ "$ARMED" = 1 ]; then
 		# leaving a held tuning on Ctrl-C, SIGTERM or a closed terminal
 		# is the intended way out, not a failure
@@ -105,7 +120,12 @@ on_exit() {
 		if do_reset; then
 			echo "tune: system restored" >&2
 		else
-			echo "tune: rollback FAILED -- run: sudo $0 reset" >&2
+			echo "tune: error: rolling back failed" >&2
+			echo "" >&2
+			echo "fix it with:" >&2
+			echo "" >&2
+			echo "sudo $0 reset" >&2
+			echo "" >&2
 		fi
 	fi
 	exit "$rc"
@@ -166,7 +186,10 @@ cpulist_norm() {
 	expand_cpulist "$1" | sort -n | tr '\n' ' '
 }
 
+# empty on a kernel built without THP (Raspberry Pi OS's): nothing to
+# turn off there
 thp_current() {
+	[ -r /sys/kernel/mm/transparent_hugepage/enabled ] || return 0
 	sed -n 's/.*\[\(.*\)\].*/\1/p' /sys/kernel/mm/transparent_hugepage/enabled
 }
 
@@ -212,6 +235,216 @@ swap_kb() {
 	awk 'NR>1 {s+=$3} END {print s+0}' /proc/swaps
 }
 
+# Makes sure the radios about to be blocked come back, whatever happens
+# to this script, the session it runs in or the machine. Takes them from
+# radios and radio_types.
+guard_radios() {
+	# A timer of systemd's own turns them on again after RADIO_LIMIT. It
+	# only unblocks; the rest of the tuning stays until reset. By id and
+	# by type: a radio whose driver restarts meanwhile returns under a
+	# new id.
+	rf=$(command -v rfkill)
+	cmd=
+	if [ "$radios" = unknown ]; then
+		cmd="$rf unblock all"
+	else
+		for r in $radios $radio_types; do
+			cmd="$cmd$rf unblock $r; "
+		done
+	fi
+	# one left over from a tuning that was never reset would make
+	# systemd-run refuse the name
+	radio_timer_off
+	systemd-run --quiet --collect --unit=tune-radios \
+		--on-active="$RADIO_LIMIT" --timer-property=AccuracySec=1s \
+		/bin/sh -c "$cmd" ||
+		die "could not start the timer that turns the radios back on, so they are left on"
+	[ "$(systemctl is-active tune-radios.timer 2>/dev/null)" = active ] ||
+		die "the timer that turns the radios back on is not running, so they are left on"
+	RADIOS_BACK=$(date -d "+$RADIO_LIMIT seconds" +%H:%M)
+
+	# systemd-rfkill saves every change of a radio and applies it at the
+	# next boot, so a power cut while tuned would boot with the radios
+	# off. Masked until reset, in /run: a reboot removes the mask too.
+	if systemctl cat systemd-rfkill.socket >/dev/null 2>&1; then
+		# it writes a change only as it exits, 5 s after the last one;
+		# stopped before that, it loses the change
+		wait_rfkill_saved
+		systemctl mask --runtime --now --quiet systemd-rfkill.socket systemd-rfkill.service ||
+			die "could not stop systemd-rfkill from saving the radios' state for the next boot"
+		[ "$(systemctl is-enabled systemd-rfkill.socket 2>/dev/null)" = masked-runtime ] ||
+			die "systemd-rfkill.socket is not masked, so a reboot while tuned could start with the radios off"
+		for u in systemd-rfkill.socket systemd-rfkill.service; do
+			if systemctl is-active --quiet "$u"; then
+				die "$u is still active, so a reboot while tuned could start with the radios off"
+			fi
+		done
+	fi
+}
+
+wait_rfkill_saved() {
+	n=0
+	while systemctl is-active --quiet systemd-rfkill.service && [ "$n" -lt 15 ]; do
+		sleep 1
+		n=$((n + 1))
+	done
+}
+
+radio_timer_off() {
+	systemctl stop tune-radios.timer tune-radios.service 2>/dev/null || true
+	systemctl reset-failed tune-radios.timer tune-radios.service 2>/dev/null || true
+}
+
+# undoes guard_radios' mask; fails if there was none
+rfkill_saving_on() {
+	[ -L /run/systemd/system/systemd-rfkill.socket ] || return 1
+	systemctl unmask --runtime --quiet systemd-rfkill.socket systemd-rfkill.service 2>/dev/null &&
+		systemctl start systemd-rfkill.socket 2>/dev/null ||
+		note "warning: could not turn systemd-rfkill back on; radio changes are not remembered until the next boot"
+}
+
+# types among $1 that have a blocked radio
+types_blocked() {
+	for t in $1; do
+		if rfkill -n -o TYPE,SOFT 2>/dev/null | grep -q "^$t  *blocked"; then
+			printf '%s ' "$t"
+		fi
+	done
+}
+
+# $1 without repeated words
+once() {
+	printf '%s\n' $1 | sort -u | tr '\n' ' '
+}
+
+# Sets id, type, was (on or off) and name from one word of radio_states.
+radio_fields() {
+	id=${1%%:*}
+	name=${1#*:}
+	type=${name%%:*}
+	name=${name#*:}
+	was=${name%%:*}
+	name=${name#*:}
+}
+
+# The id a radio has now: its own, or the id of the radio of its name
+# where it has a new one (an adapter whose switch was off for a while);
+# nothing if it is gone.
+radio_now() {
+	if [ -e "/sys/class/rfkill/rfkill$1" ]; then
+		echo "$1"
+		return
+	fi
+	for d in /sys/class/rfkill/rfkill*; do
+		if [ "$(tr -c '[:alnum:]._\n-' _ <"$d/name" 2>/dev/null)" = "$2" ]; then
+			echo "${d##*rfkill}"
+			return
+		fi
+	done
+}
+
+# Puts the radios back as radio_states has them, and turns the timer off
+# once those that were on are on.
+restore_radios() {
+	# first of all, each by its id: the way back to a machine reached
+	# over Wi-Fi
+	if [ "$radios" = unknown ]; then
+		rfkill unblock all || true
+	else
+		for id in $radios; do
+			rfkill unblock "$id" 2>/dev/null || true
+		done
+	fi
+	if rfkill_saving_on; then
+		# Started again, systemd-rfkill sets every radio to the state it
+		# has saved for it, which need not be the one it had before
+		# tuning. Wait for that (it starts a moment after its socket);
+		# what follows sets back what it changed, and systemd-rfkill
+		# then saves that.
+		sleep 2
+		wait_rfkill_saved
+	fi
+	changed=
+	failed=
+
+	# Off before, on now: off again. One that is missing gets a moment
+	# to return (an adapter does when its switch is on again); if it
+	# comes later still, nothing here can turn it off.
+	for k in $radio_states; do
+		radio_fields "$k"
+		[ "$was" = off ] || continue
+		now=$(radio_now "$id" "$name")
+		n=0
+		while [ -z "$now" ] && [ "$n" -lt 5 ]; do
+			sleep 1
+			n=$((n + 1))
+			now=$(radio_now "$id" "$name")
+		done
+		if [ -z "$now" ]; then
+			note "warning: the $type radio $name was off and is missing now; if it returns, it may be on"
+			continue
+		fi
+		f=/sys/class/rfkill/rfkill$now/soft
+		if [ "$(cat "$f" 2>/dev/null)" = 0 ]; then
+			rfkill block "$now" 2>/dev/null || true
+			if [ "$(cat "$f" 2>/dev/null)" = 0 ]; then
+				note "warning: could not turn the $type radio $name off again"
+				failed=1
+			else
+				changed="$changed $type"
+			fi
+		fi
+	done
+
+	# A radio that was on before and is off now: on again. One that is
+	# missing: its whole type on. Missing is normal on a ThinkPad: the
+	# Bluetooth adapter disappears while its switch
+	# (tpacpi_bluetooth_sw) is off, and returns with a new id once the
+	# switch is on. One case does not end as it was: the switch read
+	# "off" before tuning although the adapter was on. The adapter
+	# cannot be on while its switch is off, so the switch ends "on".
+	types=$radio_types
+	for k in $radio_states; do
+		radio_fields "$k"
+		[ "$was" = on ] || continue
+		now=$(radio_now "$id" "$name")
+		f=/sys/class/rfkill/rfkill$now/soft
+		if [ -z "$now" ]; then
+			types="$types $type"
+		elif [ "$(cat "$f" 2>/dev/null)" != 0 ]; then
+			rfkill unblock "$now" 2>/dev/null || true
+			changed="$changed $type"
+		fi
+	done
+	types=$(once "$types")
+	for t in $(types_blocked "$types"); do
+		rfkill unblock "$t" 2>/dev/null || true
+		changed="$changed $t"
+	done
+	left=$(types_blocked "$types")
+	for k in $radio_states; do
+		radio_fields "$k"
+		[ "$was" = on ] || continue
+		now=$(radio_now "$id" "$name")
+		if [ -n "$now" ] && [ "$(cat "/sys/class/rfkill/rfkill$now/soft" 2>/dev/null)" != 0 ]; then
+			left="$left $type"
+		fi
+	done
+	if [ -n "$left" ]; then
+		note "warning: could not turn these radios back on: $(once "$left")"
+		failed=1
+	fi
+	if [ -n "$failed" ]; then
+		note "the timer that turns the radios on at the time limit is left running"
+		lost="$lost radios;"
+	else
+		radio_timer_off
+		if [ -n "$changed" ]; then
+			note "radios put back as before tuning: $(once "$changed")"
+		fi
+	fi
+}
+
 set_verify() {
 	path=$1
 	want=$2
@@ -223,7 +456,7 @@ set_verify() {
 preflight() {
 	[ "$(id -u)" = 0 ] || die "must run as root"
 
-	for c in systemctl awk sed sort tr; do
+	for c in systemctl systemd-run awk sed sort tr; do
 		have "$c" || die "missing required command: $c"
 	done
 
@@ -278,8 +511,6 @@ CPU shielding at all."
 	fi
 
 	[ -r /sys/devices/system/cpu/present ] || die "cannot read /sys/devices/system/cpu/present"
-	[ -r /sys/kernel/mm/transparent_hugepage/enabled ] ||
-		die "cannot read transparent_hugepage/enabled"
 }
 
 report() {
@@ -308,18 +539,25 @@ report() {
 		fi
 	done
 	echo "ceiling below max:  ${capped:- none}"
-	echo "on AC power:         $(cat /sys/class/power_supply/A*/online 2>/dev/null | head -1 || echo n/a)"
+	ac=$(cat /sys/class/power_supply/A*/online 2>/dev/null | head -1)
+	echo "on AC power:         ${ac:-n/a}"
 	echo "ASLR:                $(cat /proc/sys/kernel/randomize_va_space)"
-	echo "THP:                 $(thp_current)"
-	echo "swap in use (KiB):   $(swap_kb)"
+	thp=$(thp_current)
+	echo "THP:                 ${thp:-n/a}"
+	echo "swap turned on (KiB): $(swap_kb)"
 	echo "perf sample rate:    $(cat /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || echo n/a)"
 	echo "perf cpu time limit: $(cat /proc/sys/kernel/perf_cpu_time_max_percent 2>/dev/null || echo n/a) % (0: off)"
 	echo "system.slice cpus:   $(cat /sys/fs/cgroup/system.slice/cpuset.cpus.effective 2>/dev/null || echo n/a)"
 	echo "user.slice cpus:     $(cat /sys/fs/cgroup/user.slice/cpuset.cpus.effective 2>/dev/null || echo n/a)"
+	echo "radios:              $(rfkill -n -o TYPE,SOFT 2>/dev/null | tr '\n' ' ' || true)"
+	echo "radio timer:         $(systemctl is-active tune-radios.timer 2>/dev/null || true)"
 	echo "tuning state file:   $([ -f "$STATE" ] && echo present || echo absent)"
 }
 
 do_reset() {
+	# not to be interrupted: stopped half-way, radios, swap and services
+	# would stay off
+	trap '' HUP INT TERM PIPE
 	max=$(cpu_max)
 
 	i=0
@@ -369,7 +607,6 @@ do_reset() {
 		if [ -n "$thp" ]; then
 			echo "$thp" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
 		fi
-		rm -f "$STATE"
 	fi
 
 	# Restoring turbo does not lift the ceiling of a CPU that was offline
@@ -395,7 +632,7 @@ do_reset() {
 			note "warning: $c is capped at $(cat "$d/scaling_max_freq") kHz, not $hi kHz as before"
 		fi
 	done
-	if [ -n "${defaffinity:-}" ] && [ "${defaffinity:-unknown}" != unknown ]; then
+	if [ "${defaffinity:-unknown}" != unknown ]; then
 		echo "$defaffinity" > /proc/irq/default_smp_affinity 2>/dev/null || true
 	fi
 
@@ -415,21 +652,29 @@ do_reset() {
 	# turned Bluetooth on), so they are left alone. An older tune's state
 	# file lacks the lists: then all are turned on.
 	if [ "$had_state" = 0 ]; then
-		note "no saved state ($STATE): radios, swap and services left as they are"
+		note "no saved state ($STATE): clock limits and IRQs set to their defaults; radios, swap and services left as they are"
+		rfkill_saving_on || true
 		return 0
 	fi
-	if [ "${radios-unknown}" != unknown ]; then
-		for id in $radios; do
-			rfkill unblock "$id" 2>/dev/null || true
-		done
-	elif have rfkill; then
-		rfkill unblock all || true
-	fi
+	# what did not come back; with any, the state file stays for another
+	# reset
+	lost=
+	radios=${radios-unknown}
+	radio_types=${radio_types-}
+	radio_states=${radio_states-}
+	restore_radios
 	if [ "${swaps+set}" = set ]; then
 		# not swapon -a: a swap file set up outside /etc/fstab (Raspberry
 		# Pi OS's, say) would stay off
+		# each as "device:priority"; a negative priority is the kernel's
+		# own choice, not a setting
 		for s in $swaps; do
-			swapon "$s" 2>/dev/null || true
+			case "${s##*:}" in
+			-* | *[!0-9]* | "") swapon "${s%:*}" 2>/dev/null || true ;;
+			*) swapon -p "${s##*:}" "${s%:*}" 2>/dev/null || true ;;
+			esac
+			awk -v d="${s%:*}" 'NR > 1 && $1 == d { on = 1 } END { exit !on }' /proc/swaps ||
+				lost="$lost swap on ${s%:*};"
 		done
 	else
 		swapon -a 2>/dev/null || true
@@ -441,7 +686,17 @@ do_reset() {
 	fi
 	for svc in $svcs; do
 		systemctl cat "$svc" >/dev/null 2>&1 && systemctl start "$svc" 2>/dev/null || true
+		# those in the saved list ran before
+		if [ "${stopped+set}" = set ]; then
+			systemctl is-active --quiet "$svc" || lost="$lost $svc;"
+		fi
 	done
+	if [ -n "$lost" ]; then
+		note "warning: not back as before:$lost"
+		return 1
+	fi
+	# last, so that a reset that did not finish can be run again
+	rm -f "$STATE"
 }
 
 auto_select() {
@@ -463,6 +718,10 @@ trap on_exit EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# Output piped into a program that has ended (tee after Ctrl-C) would
+# kill this script at its next message, before it could undo anything.
+# Ignored, the message just fails.
+trap '' PIPE
 
 case "${1:-}" in
 -h | --help)
@@ -477,8 +736,12 @@ check)
 reset)
 	[ $# -eq 1 ] || usage
 	[ "$(id -u)" = 0 ] || die "must run as root"
-	do_reset
-	note "system restored"
+	do_reset || die_cmd "the system is not restored in full" \
+		"sudo $0 reset" \
+		"If something cannot come back, give up on it with:
+
+sudo rm $STATE"
+	[ "$had_state" = 0 ] || note "system restored"
 	exit 0
 	;;
 hold)
@@ -496,7 +759,7 @@ esac
 [ $# -le 1 ] || usage
 if [ $# -eq 1 ]; then
 	case "$1" in
-	"" | *[!0-9]*) usage ;;
+	"" | *[!0-9]* | 0?*) usage ;;
 	esac
 fi
 
@@ -505,6 +768,10 @@ preflight
 MAX=$(cpu_max)
 [ "$MAX" -gt 0 ] || die "only one CPU present, nothing to isolate"
 
+if [ -f "$STATE" ]; then
+	die_cmd "$STATE exists: the system is already tuned, or a previous run left state behind" \
+		"sudo $0 reset"
+fi
 i=1
 while [ "$i" -le "$MAX" ]; do
 	f="/sys/devices/system/cpu/cpu$i/online"
@@ -514,10 +781,6 @@ while [ "$i" -le "$MAX" ]; do
 	fi
 	i=$((i + 1))
 done
-if [ -f "$STATE" ]; then
-	die_cmd "$STATE exists: the system is already tuned, or a previous run left state behind" \
-		"sudo $0 reset"
-fi
 
 AUTO=
 if [ $# -eq 1 ]; then
@@ -533,14 +796,32 @@ fi
 
 # radios that are on now, and the swap in use, to restore exactly those
 # (an rfkill too old for -o gives unknown: reset then unblocks all)
-if rfkill -n -o ID,SOFT >/dev/null 2>&1; then
+# radio_types: the types whose radios are all on, to turn on by type
+# what cannot be found by id any more.
+# radio_states: every radio as id:type:on|off:name, to set back what
+# systemd-rfkill changes when it is started again (see restore_radios).
+if rfkill -n -o ID,TYPE,SOFT >/dev/null 2>&1; then
 	radios=$(rfkill -n -o ID,SOFT | awk '$2 == "unblocked" { printf "%s ", $1 }')
+	radio_types=$(rfkill -n -o TYPE,SOFT | awk '
+		$2 == "unblocked" { on[$1] = 1 }
+		$2 == "blocked" { off[$1] = 1 }
+		END { for (t in on) if (!(t in off)) printf "%s ", t }')
+	radio_states=
+	for d in /sys/class/rfkill/rfkill*; do
+		[ -r "$d/soft" ] || continue
+		case "$(cat "$d/soft")" in 0) on=on ;; *) on=off ;; esac
+		radio_states="$radio_states${d##*rfkill}:$(cat "$d/type"):$on:$(tr -c '[:alnum:]._\n-' _ <"$d/name") "
+	done
 else
 	radios=unknown
+	radio_types=
+	radio_states=
 fi
 {
 	echo "radios='$radios'"
-	echo "swaps='$(awk 'NR > 1 { printf "%s ", $1 }' /proc/swaps)'"
+	echo "radio_types='$radio_types'"
+	echo "radio_states='$radio_states'"
+	echo "swaps='$(awk 'NR > 1 { printf "%s:%s ", $1, $5 }' /proc/swaps)'"
 	echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
 	echo "turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo unknown)"
 	echo "boost=$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo unknown)"
@@ -553,10 +834,31 @@ fi
 	echo "irqs='$(saved_irqs)'"
 	# appended to below for each service stopped
 	echo "stopped=''"
-} > "$STATE"
+} > "$STATE.new"
+# in one step, so that reset never reads half a file
+mv "$STATE.new" "$STATE"
 ARMED=1
 
-rfkill block all || die "rfkill block failed"
+# nothing to guard if no radio is on
+if [ -n "$radios" ]; then
+	guard_radios
+fi
+# Each radio by its id, not "all": that would also make the kernel block
+# every radio that appears from then on, also after the reset, which
+# unblocks by id. A radio may vanish when another one is blocked (a
+# laptop's Bluetooth adapter with its switch), hence no error.
+if [ "$radios" = unknown ]; then
+	rfkill block all || die "rfkill block failed"
+else
+	for id in $radios; do
+		rfkill block "$id" 2>/dev/null || true
+	done
+	still=$(rfkill -n -o TYPE,SOFT | awk '$2 == "unblocked" { printf "%s ", $1 }')
+	[ -z "$still" ] || note "warning: these radios are still on: $still"
+	# those that are off now, so record can tell when the timer has
+	# turned them back on
+	echo "radios_off='$(rfkill -n -o ID,SOFT | awk '$2 == "blocked" { printf "%s ", $1 }')'" >>"$STATE"
+fi
 
 for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
 	[ -w "$f" ] || continue
@@ -584,10 +886,15 @@ for d in /sys/devices/system/cpu/cpu*/cpufreq; do
 done
 PINNED=$(cat "/sys/devices/system/cpu/cpu$BENCH/cpufreq/scaling_max_freq" 2>/dev/null || echo unknown)
 
-echo never > /sys/kernel/mm/transparent_hugepage/enabled || die "cannot disable THP"
-[ "$(thp_current)" = never ] || die "THP is still $(thp_current) after write"
+if [ -e /sys/kernel/mm/transparent_hugepage/enabled ]; then
+	echo never > /sys/kernel/mm/transparent_hugepage/enabled || die "cannot disable THP"
+	[ "$(thp_current)" = never ] || die "THP is still $(thp_current) after write"
+	OFF="radios, THP and swap"
+else
+	OFF="radios and swap"
+fi
 
-used=$(swap_kb)
+used=$(awk 'NR > 1 { s += $4 } END { print s + 0 }' /proc/swaps)
 if [ "$used" -gt 0 ]; then
 	note "turning swap off (${used} KiB in use; this blocks until it is paged back in)"
 fi
@@ -697,9 +1004,11 @@ else
 	note "warning: perf_event_max_sample_rate not writable; left as-is"
 fi
 
-# not nohz_full with intel_pstate: preflight refuses that combination
+# nohz_full is suggested only where it can be used: not with
+# intel_pstate (preflight refuses that pair), and not on a kernel built
+# without it (no nohz_full file)
 params="isolcpus rcu_nocbs"
-if [ ! -d /sys/devices/system/cpu/intel_pstate ]; then
+if [ ! -d /sys/devices/system/cpu/intel_pstate ] && [ -e /sys/devices/system/cpu/nohz_full ]; then
 	params="$params nohz_full"
 fi
 missing=
@@ -715,7 +1024,10 @@ case "$PINNED" in
 *) clock="$((PINNED / 1000)) MHz" ;;
 esac
 note "isolated CPU $BENCH$AUTO (${OFFLINED:+SMT sibling $OFFLINED offline, }$moved IRQs moved off it), clock pinned at $clock"
-note "until restored: radios, THP and swap are off${STOPPED:+; $STOPPED stopped}"
+note "until restored: $OFF are off${STOPPED:+; $STOPPED stopped}"
+if [ -n "$radios" ]; then
+	note "the radios come back on by themselves at $RADIOS_BACK, if not restored before"
+fi
 if [ -n "$missing" ]; then
 	if [ -d /sys/devices/system/cpu/intel_pstate ]; then
 		note "for full isolation, also boot with$missing (nohz_full is left out: with intel_pstate it makes the clock unstable)"

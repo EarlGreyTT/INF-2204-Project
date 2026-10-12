@@ -7,11 +7,11 @@
 # often each instruction runs (callgrind)
 #
 # Usage:
-#   record all -n <nick> [-r <runs>] [-u] [-c <cycles>] [-m <dir>]
+#   record all -n <nick> [-r <runs>] [-u] [-c <cycles>] [-q] [-m <dir>]
 #              <program> [<arg>...]
-#   record time -n <nick> [-u] [-c <cycles>] [-m <dir>]
+#   record time -n <nick> [-u] [-c <cycles>] [-q] [-m <dir>]
 #               <program> [<arg>...]
-#   record count -n <nick> [-m <dir>] <program> [<arg>...]
+#   record count -n <nick> [-q] [-m <dir>] <program> [<arg>...]
 #
 #   all          tune the system, record time <runs> times, restore the
 #                system, then record count once; as root
@@ -27,12 +27,24 @@
 #   -u           untuned baseline: skip tune, run the program anywhere
 #   -c <cycles>  sampling period for perf (default 100003); fewer samples
 #                disturb the program less
+#   -q           throw away what the program prints to standard output
+#                (normally its first 100 lines are kept in meta.txt);
+#                for a program that prints its result, like xz -c
 #   -m <dir>     the measurements folder (default: measurements/ in the
 #                repo)
 #
 # all restores the system also on errors and Ctrl-C. It counts after
 # that, as the user who ran sudo: counts do not depend on tuning, and
-# callgrind is slow.
+# callgrind is slow. While the system is tuned the radios are off; tune
+# turns them back on after an hour whatever happens, and a time run
+# during which they came back fails. If a series of runs takes longer
+# than that hour, all restores the system and tunes it again before the
+# next run.
+#
+# The program runs with the same small environment in every run (see
+# ENVIRONMENT below), whoever runs it: the environment's size shifts the
+# stack and with it the timing (Mytkowicz et al. 2009), and what is in
+# it (the home folder, the locale, ...) can change what a program does.
 #
 # Time runs by hand, from two terminals:
 #   sudo scripts/tune hold
@@ -48,13 +60,15 @@
 #   <program>/count/...                  the same for counts
 #
 # A time run's files (<run> is e.g. t14-1.run1):
-#   <run>.samples.txt   "rank count location (dso)", all code, kernel too
+#   <run>.samples.csv   the ranked instructions (see rank), all code,
+#                       kernel too
 #   <run>.meta.txt      what was run, how it was sampled, and the
 #                       program's output
 #   <run>.perf.data     raw samples
 #
 # A count run's files:
-#   <run>.counts.txt      "rank count location (dso)", all user-space code
+#   <run>.counts.csv      the ranked instructions (see rank), all
+#                         user-space code
 #   <run>.meta.txt        what was run, and the program's output
 #   <run>.callgrind.out   raw counts
 #   <run>.valgrind.log    load addresses, needed to rank the raw counts
@@ -76,13 +90,16 @@
 # into the slice before exec'ing the program, so a sample on any other
 # CPU fails the run.
 #
-# Count: locations are named as perf names them (sym+0xoff), so the
-# lists line up with the time runs'. Valgrind's own code is left out;
-# callgrind sees user space only.
+# Count: instructions are named as perf names them (function and
+# offset), so the lists line up with the time runs'. Valgrind's own code
+# is left out; callgrind sees user space only.
 
 set -eu
 
 NAME=record
+# the program's environment; no existing home folder, so that no user's
+# settings reach it
+ENVIRONMENT="PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C TZ=UTC"
 SCRIPTS=$(dirname "$(readlink -f "$0")")
 CMDLINE="$0 $*"
 
@@ -107,6 +124,22 @@ die() {
 	echo "$NAME: error: $1" >&2
 	record_error "$1"
 	exit 1
+}
+
+# The radios tune turned off that are on again. tune's timer turns them
+# back on after a while, so that a machine reached over Wi-Fi cannot
+# stay cut off; a run with them on is noisier than the others.
+radios_back() {
+	[ -f /run/tune.state ] || return 0
+	(
+		. /run/tune.state
+		for id in ${radios_off:-}; do
+			f=/sys/class/rfkill/rfkill$id/soft
+			if [ -r "$f" ] && [ "$(cat "$f")" = 0 ]; then
+				echo "$id"
+			fi
+		done
+	)
 }
 
 die_cmd() {
@@ -167,7 +200,7 @@ install_hint() {
 # perf's package: per kernel on Ubuntu, linux-perf on Debian and
 # Raspberry Pi OS
 perf_hint() {
-	if grep -qi '^ID\(_LIKE\)\?=.*ubuntu' /etc/os-release 2>/dev/null; then
+	if grep -Eqi '^ID(_LIKE)?=.*ubuntu' /etc/os-release 2>/dev/null; then
 		echo "sudo apt install linux-tools-common linux-tools-$(uname -r)"
 	else
 		install_hint linux-perf perf perf
@@ -262,15 +295,14 @@ platform() {
 		echo "firmware:  $(cat "$d/bios_version" 2>/dev/null)"
 	else
 		echo "machine:   $(tr -d '\0' 2>/dev/null </proc/device-tree/model || echo unknown)"
-		if have vcgencmd; then
-			echo "firmware:  $(vcgencmd version 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
-		else
-			echo "firmware:  unknown"
-		fi
+		# a Raspberry Pi's boot firmware, from the device tree: everyone
+		# may read that, so root and a user get the same line
+		echo "firmware:  $(tr -d '\0' 2>/dev/null </proc/device-tree/chosen/bootloader/version || echo unknown)"
 	fi
 	LC_ALL=C lscpu | sed -n 's/^Model name: *\(.*\)/cpu:       \1/p'
 	echo "microcode: $(sed -n 's/^microcode[[:space:]]*: //p' /proc/cpuinfo | head -1)"
-	LC_ALL=C lscpu | awk -F ':[ \t]+' '/^(Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)|L[0-9][di]* cache):/ { print $1 ": " $2 }'
+	# ARM boards count cores per cluster, and have no sockets ("-")
+	LC_ALL=C lscpu | awk -F ':[ \t]+' '/^(Thread\(s\) per core|Core\(s\) per (socket|cluster)|Socket\(s\)|Cluster\(s\)|L[0-9][di]* cache):/ && $2 != "-" { print $1 ": " $2 }'
 	# lsmem counts whole memory blocks, steadier than MemTotal, but needs
 	# memory hotplug support, which many ARM kernels lack
 	mem=$(LC_ALL=C lsmem --summary --bytes 2>/dev/null | sed -n 's/^Total online memory: *//p')
@@ -279,7 +311,13 @@ platform() {
 	else
 		echo "memory:    $(awk '/^MemTotal:/ { print $2 * 1024 }' /proc/meminfo) bytes (MemTotal)"
 	fi
-	echo "os:        $(. /etc/os-release && echo "$PRETTY_NAME")"
+	# Ubuntu's PRETTY_NAME includes the point release (26.04.1); Debian's
+	# doesn't, and Raspberry Pi OS's image date in /etc/rpi-issue is fixed
+	# at build time and stays stale after updates, so DEBIAN_VERSION_FULL
+	# (kept current by apt) is added where PRETTY_NAME lacks it.
+	echo "os:        $(. /etc/os-release; printf '%s' "$PRETTY_NAME"
+		case $PRETTY_NAME in *[0-9].[0-9]*) ;; *) [ -n "${DEBIAN_VERSION_FULL:-}" ] &&
+			printf ' (%s)' "$DEBIAN_VERSION_FULL" ;; esac)"
 	echo "kernel:    $(uname -srvm)"
 	echo "cmdline:   $(cat /proc/cmdline)"
 	echo "libc:      $(ldd --version 2>&1 | head -1)"
@@ -468,16 +506,26 @@ meta_common() {
 	echo "command:       $PROG $*"
 	echo "binary:        sha256 $PROG_SHA, stored as binaries/$(basename "$BINARY")"
 	echo "compiler:      $(readelf -p .comment "$PROG" 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | head -1)"
+	# from the debug information of the program's first source file: the
+	# options in force, a distribution's own defaults among them
+	echo "compiled with: $(readelf --debug-dump=info "$PROG" 2>/dev/null | sed -n '/DW_AT_producer/ { s/.*): //p; q; }')"
+	echo "environment:   $ENVIRONMENT"
+	echo "user:          $(id -un "$RUN_UID" 2>/dev/null || echo "$RUN_UID")"
 	echo "aslr:          $(cat /proc/sys/kernel/randomize_va_space) (randomize_va_space; 2: full)"
+	echo "page size:     $(getconf PAGESIZE) bytes"
 }
 
 # The program's output, for the end of meta.txt; removes the files.
 meta_output() {
 	for f in program.out program.err; do
 		echo ""
-		echo "== $f (first 100 lines)"
-		head -n 100 "$STAGE/$f"
-		rm "$STAGE/$f"
+		if [ -e "$STAGE/$f" ]; then
+			echo "== $f (first 100 lines)"
+			head -n 100 "$STAGE/$f"
+			rm "$STAGE/$f"
+		else
+			echo "== $f (discarded, -q)"
+		fi
 	done
 }
 
@@ -499,13 +547,15 @@ record_all() {
 	RUNS=1
 	UNTUNED=
 	PERIOD=
+	QUIET=
 	MDIR=
-	while getopts n:r:uc:m: opt; do
+	while getopts n:r:uc:qm: opt; do
 		case "$opt" in
 		n) NICK=$OPTARG ;;
 		r) RUNS=$OPTARG ;;
 		u) UNTUNED=-u ;;
 		c) PERIOD=$OPTARG ;;
+		q) QUIET=-q ;;
 		m) MDIR=$OPTARG ;;
 		*) usage ;;
 		esac
@@ -531,8 +581,15 @@ record_all() {
 	untune() {
 		if [ "$TUNED" = 1 ]; then
 			TUNED=0
-			"$SCRIPTS/tune" reset || note "warning: reset failed -- run: sudo $SCRIPTS/tune reset"
+			# tune says what to do if it fails
+			"$SCRIPTS/tune" reset || true
 		fi
+	}
+	# TUNED first: a signal while tune runs must still lead to a reset
+	tune_system() {
+		TUNED=1
+		# tune rolls itself back if it fails part-way
+		"$SCRIPTS/tune" keep >/dev/null || { TUNED=0; die "tuning failed"; }
 	}
 	trap untune EXIT
 	trap 'exit 129' HUP
@@ -542,23 +599,28 @@ record_all() {
 
 	failed=0
 	if [ -z "$UNTUNED" ]; then
-		TUNED=1
-		# tune rolls itself back if it fails part-way
-		"$SCRIPTS/tune" keep >/dev/null || { TUNED=0; die "tuning failed"; }
+		tune_system
 	fi
 	i=1
 	while [ "$i" -le "$RUNS" ]; do
+		# a long series can outlast tune's time limit for the radios
+		if [ "$TUNED" = 1 ] && [ -n "$(radios_back)" ]; then
+			note "the radios are back on (tune turns them on after an hour); restoring the system and tuning again"
+			"$SCRIPTS/tune" reset >/dev/null || die "restoring the system failed"
+			TUNED=0
+			tune_system
+		fi
 		"$SCRIPTS/record" time -n "$NICK" $UNTUNED \
-			${PERIOD:+-c} ${PERIOD:+"$PERIOD"} ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@" ||
+			${PERIOD:+-c} ${PERIOD:+"$PERIOD"} $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@" ||
 			failed=$((failed + 1))
 		i=$((i + 1))
 	done
 	untune
 
 	if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
-		set -- sudo -u "$SUDO_USER" -- "$SCRIPTS/record" count -n "$NICK" ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
+		set -- sudo -u "$SUDO_USER" -- "$SCRIPTS/record" count -n "$NICK" $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
 	else
-		set -- "$SCRIPTS/record" count -n "$NICK" ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
+		set -- "$SCRIPTS/record" count -n "$NICK" $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
 	fi
 	"$@" || failed=$((failed + 1))
 
@@ -572,11 +634,13 @@ record_time() {
 	NICK=
 	MDIR=
 	UNTUNED=0
-	while getopts n:uc:m: opt; do
+	OUT=
+	while getopts n:uc:qm: opt; do
 		case "$opt" in
 		n) NICK=$OPTARG ;;
 		u) UNTUNED=1 ;;
 		c) PERIOD=$OPTARG ;;
+		q) OUT=/dev/null ;;
 		m) MDIR=$OPTARG ;;
 		*) usage ;;
 		esac
@@ -592,6 +656,9 @@ record_time() {
 	COMM=$(printf '%s' "$BASE" | cut -c1-15)
 
 	have perf || die_cmd "perf is not installed" "$(perf_hint)"
+	have setpriv || die_cmd "setpriv is not installed" "$(install_hint util-linux util-linux util-linux)"
+	# by its path: the program's environment has a PATH of its own
+	SETPRIV=$(command -v setpriv)
 	if [ "$UNTUNED" = 0 ] && ! have systemd-run; then
 		die "systemd-run is missing; it is needed to start the program in tune.slice"
 	fi
@@ -631,6 +698,10 @@ for an untuned baseline run."
 				"then tune again."
 			;;
 		esac
+		[ -z "$(radios_back)" ] ||
+			die_cmd "the radios are back on: tune's time limit for them has passed" \
+				"sudo $SCRIPTS/tune reset" \
+				"then tune again."
 	fi
 
 	start_run "$MDIR" time "$NICK"
@@ -640,11 +711,22 @@ for an untuned baseline run."
 	# right before and after (for noise_report), so the noise covers the
 	# program, not perf starting up. The process-name filter below drops
 	# its samples.
+	set -- "$PROG" "$@"
+	# perf needs root; the program runs as the user who ran sudo, as it
+	# does in count runs: what a user may do can change what a program
+	# does
+	RUN_UID=$(id -u)
+	if [ -n "${SUDO_UID:-}" ] && [ "$SUDO_UID" != 0 ]; then
+		RUN_UID=$SUDO_UID
+		set -- "$SETPRIV" --reuid "$SUDO_UID" --regid "${SUDO_GID:-$SUDO_UID}" --init-groups "$@"
+	fi
+	# word splitting intended: ENVIRONMENT is a list of settings. Inside
+	# systemd-run, which adds a variable of its own.
+	set -- env -i $ENVIRONMENT "$@"
 	if [ "$UNTUNED" = 0 ]; then
-		set -- systemd-run --scope --slice=tune --quiet "$PROG" "$@"
+		set -- systemd-run --scope --slice=tune --quiet "$@"
 		note "recording $BASE as $RUN on CPU $BENCH"
 	else
-		set -- "$PROG" "$@"
 		note "recording $BASE as $RUN, untuned"
 	fi
 	perf record -e "$EVENT" -c "$PERIOD" --sample-cpu -o "$STAGE/perf.data" -- \
@@ -657,18 +739,23 @@ for an untuned baseline run."
 				t=/sys/devices/system/cpu/cpu$1/thermal_throttle
 				echo "$(cat "$t/core_throttle_count" 2>/dev/null || echo -) $(cat "$t/package_throttle_count" 2>/dev/null || echo -)" >"$2.throttle"
 			}
-			cpu=$1 dir=$2; shift 2
+			cpu=$1 dir=$2 out=$3; shift 3
 			[ -z "$cpu" ] || snapshot "$cpu" "$dir/noise.before"
-			"$@" >"$dir/program.out" 2>"$dir/program.err"
+			"$@" >"$out" 2>"$dir/program.err"
 			echo $? >"$dir/status"
 			[ -z "$cpu" ] || snapshot "$cpu" "$dir/noise.after"' \
-		sh "$BENCH" "$STAGE" "$@" \
+		sh "$BENCH" "$STAGE" "${OUT:-$STAGE/program.out}" "$@" \
 		2>"$STAGE/perf-record.log" ||
 		die "perf record failed: $(cat "$STAGE/perf-record.log")"
 	[ -s "$STAGE/status" ] || die "the program did not run to the end; see $STAGE/perf-record.log"
+	if [ "$UNTUNED" = 0 ]; then
+		[ -f /run/tune.state ] || die "the system was restored during the run, so it was not tuned throughout"
+		[ -z "$(radios_back)" ] ||
+			die "the radios came back on during the run (tune's time limit for them passed), so it was noisier than the others"
+	fi
 	status=$(cat "$STAGE/status")
 	rm "$STAGE/status"
-	[ "$status" = 0 ] || program_failed "$status" "the program (or systemd-run)"
+	[ "$status" = 0 ] || program_failed "$status" "the program (or what starts it: systemd-run, env, setpriv)"
 
 	perf script -i "$STAGE/perf.data" --comms "$COMM" -F cpu,time,period \
 		>"$STAGE/check.raw" 2>"$STAGE/perf-script.log" ||
@@ -725,15 +812,16 @@ for an untuned baseline run."
 	fi
 
 	"$SCRIPTS/rank" time "$STAGE/perf.data" "$BASE" \
-		>"$STAGE/samples.txt" 2>"$STAGE/rank.log" ||
+		>"$STAGE/samples.csv" 2>"$STAGE/rank.log" ||
 		die "ranking failed: $(cat "$STAGE/rank.log")"
 	rm "$STAGE/rank.log"
-	programs=$(awk -v dso="($BASE)" '$NF == dso' "$STAGE/samples.txt" | wc -l)
+	programs=$(awk -F, -v f="$BASE" 'NR > 1 && $NF == f' "$STAGE/samples.csv" | wc -l)
 	[ "$programs" -gt 0 ] ||
 		die "no samples in $BASE's own code; perf could not match its samples to $PROG"
-	# kernel code shows up as [kernel.kallsyms] or [module]
-	kernel=$(awk '{ t += $2 } $NF ~ /^\(\[/ && $NF != "([unknown])" { k += $2 }
-		END { printf "%.1f", t ? 100 * k / t : 0 }' "$STAGE/samples.txt")
+	# kernel code shows up as [kernel.kallsyms] or [module]; [vdso] is
+	# kernel-provided code that runs in user space
+	kernel=$(awk -F, 'NR > 1 { t += $2 } NR > 1 && $NF ~ /^\[/ && $NF != "[unknown]" && $NF != "[vdso]" { k += $2 }
+		END { printf "%.1f", t ? 100 * k / t : 0 }' "$STAGE/samples.csv")
 
 	if [ -n "$BENCH" ]; then
 		noise_report "$BENCH" "$STAGE/noise.before" "$STAGE/noise.after" >"$STAGE/noise.txt"
@@ -751,7 +839,7 @@ for an untuned baseline run."
 		else
 			echo "tuned:         no"
 		fi
-		echo "samples:       $nsamples, at $(wc -l <"$STAGE/samples.txt") locations, $programs of them in $BASE"
+		echo "samples:       $nsamples, at $(($(wc -l <"$STAGE/samples.csv") - 1)) locations, $programs of them in $BASE"
 		echo "clock:         $clock"
 		echo "kernel:        $kernel% of the samples"
 		if [ -n "$BENCH" ]; then
@@ -784,9 +872,11 @@ record_count() {
 	NAME="record count"
 	NICK=
 	MDIR=
-	while getopts n:m: opt; do
+	OUT=
+	while getopts n:qm: opt; do
 		case "$opt" in
 		n) NICK=$OPTARG ;;
+		q) OUT=/dev/null ;;
 		m) MDIR=$OPTARG ;;
 		*) usage ;;
 		esac
@@ -799,6 +889,8 @@ record_count() {
 	ARGS="$*"
 
 	have valgrind || die_cmd "valgrind is not installed" "$(install_hint valgrind valgrind valgrind)"
+	# by its path: the program's environment has a PATH of its own
+	VALGRIND=$(command -v valgrind)
 	have python3 || die_cmd "python3 is not installed" "$(install_hint python3 python3 python)"
 	for c in nm objdump readelf; do
 		have "$c" || die_cmd "$c is not installed" "$(install_hint binutils binutils binutils)"
@@ -808,31 +900,37 @@ record_count() {
 
 	# -v -v -v logs where each file was loaded; the ranking needs that to
 	# name the PLT, init and fini code callgrind leaves unattributed.
+	# --skip-plt=no: every instruction is counted at its own address;
+	# by default callgrind adds what runs in a PLT stub, and on some
+	# platforms what follows the call, to the calling instruction.
 	note "counting $BASE's instructions as $RUN, under callgrind (slow)"
+	RUN_UID=$(id -u)
 	status=0
-	valgrind -v -v -v --tool=callgrind --dump-instr=yes \
+	# word splitting intended: ENVIRONMENT is a list of settings
+	env -i $ENVIRONMENT \
+		"$VALGRIND" -v -v -v --tool=callgrind --dump-instr=yes --skip-plt=no \
 		--callgrind-out-file="$STAGE/callgrind.out" --log-file="$STAGE/valgrind.log" \
-		"$PROG" "$@" >"$STAGE/program.out" 2>"$STAGE/program.err" || status=$?
+		"$PROG" "$@" >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" || status=$?
 	[ "$status" = 0 ] || program_failed "$status"
 
 	"$SCRIPTS/rank" count "$STAGE/callgrind.out" "$STAGE/valgrind.log" \
-		>"$STAGE/counts.txt" 2>"$STAGE/rank.log" ||
+		>"$STAGE/counts.csv" 2>"$STAGE/rank.log" ||
 		die "ranking failed: $(cat "$STAGE/rank.log")"
-	programs=$(awk -v dso="($BASE)" '$NF == dso' "$STAGE/counts.txt" | wc -l)
+	programs=$(awk -F, -v f="$BASE" 'NR > 1 && $NF == f' "$STAGE/counts.csv" | wc -l)
 	[ "$programs" -gt 0 ] ||
 		die "no counts for $BASE's own code; the object names in callgrind.out do not match it"
 
 	{
 		meta_common "$ARGS"
 		cat "$STAGE/rank.log"
-		echo "instructions:  $(wc -l <"$STAGE/counts.txt") ran, $programs of them in $BASE"
+		echo "instructions:  $(($(wc -l <"$STAGE/counts.csv") - 1)) ran, $programs of them in $BASE"
 		meta_output
 	} >"$STAGE/meta.txt"
 	total=$(sed -n 's/^total Ir: //p' "$STAGE/rank.log")
 	rm "$STAGE/rank.log"
 
 	finish_run
-	note "$(shown "$RUN_DIR")/$RUN: $total instructions ran, at $(commas "$(wc -l <"$RUN_DIR/$RUN.counts.txt")") addresses, $(commas "$programs") of them in $BASE"
+	note "$(shown "$RUN_DIR")/$RUN: $total instructions ran, at $(commas "$(($(wc -l <"$RUN_DIR/$RUN.counts.csv") - 1))") addresses, $(commas "$programs") of them in $BASE"
 }
 
 case "${1:-}" in
