@@ -1,79 +1,73 @@
 # INF-2204 Project
 
-Group project for INF-2204 at UiT. We rank a program's instructions by
-their share of its execution time and of its executed instructions, and
-study the shape of that ranked distribution across programs and
-platforms.
+We measure how a program's running time and executions are spread over
+its instructions, source lines and functions, and study the shape of
+that spread across programs and machines.
 
-## Layout
+## Setup
 
-```
-reports/       reports, one PDF per assignment
-figures/       figures used in the reports
-src/           our own test programs (the Makefile downloads the others)
-Makefile       builds the measured programs
-scripts/       measurement pipeline
-measurements/  recorded data, created by scripts/record (not committed)
-```
-
-## Requirements
-
-Linux with systemd, and `perf`, `valgrind`, `binutils`, `util-linux`,
-`python3`, `gcc`, `make`, `curl`, `unzip`. Recording needs root, and a
-laptop must be on its charger.
-
-## Usage
+Install the tools. On Ubuntu:
 
 ```sh
-make
-make data
-sudo scripts/record all -n <nick> -r 3 build/quicksort 10000000
+sudo apt install build-essential curl unzip valgrind python3 python3-matplotlib linux-tools-common linux-tools-$(uname -r)
 ```
 
-`make` builds the programs we measure, from pinned releases (about 10
-minutes, 2 with `make -j8`; `make zstd` builds one). `make data`
-fetches the files they are run on. `<nick>` is a nickname for the system
-you measure on, e.g. `t14`. Each script explains itself with `-h`.
+On Debian or Raspberry Pi OS:
 
-Every program is recorded with `sudo scripts/record all -n <nick>`,
-followed by its line from this table, in the repo's folder:
-
-| Program | Goes after `sudo scripts/record all -n <nick>` | What runs |
-|---|---|---|
-| quicksort (`src/`) | `build/quicksort 10000000` | sorting ten million numbers |
-| zstd 1.5.7 | `-q build/zstd -3 -c build/silesia` | compressing the Silesia files, level 3 |
-| xz 5.8.4 | `-q build/xz -1 -c build/silesia` | compressing them, level 1 |
-| SQLite 3.54.0 | `build/speedtest1 --testset main --singlethread --size 100 :memory:` | SQLite's own benchmark, in memory |
-| Git 2.56.0 | `-q build/git -C build/repo log -p` | printing a repository's history with every change |
-
-A `-q` before the program is `record`'s: it throws away what the program
-prints, for programs that print their result. While a time run is on,
-the radios (Wi-Fi, Bluetooth) are off; over ssh on Wi-Fi the session
-freezes meanwhile, so start it inside `screen` or `tmux` there.
-
-| Script | What it does |
-|---|---|
-| `tune` | Isolates one CPU for measuring, and restores the system afterwards. |
-| `record` | Records a program's time (perf) and instruction counts (callgrind). |
-| `rank` | Ranks a recording's instructions, or shows one function's. |
-
-If a tuned system is ever left tuned, run `sudo scripts/tune reset`.
-
-### Graphing
-Takes in a path to a csv file with the format
-
-| rank | count | function | offset | file |
-|---|---|---|---|---|
-
-Make the file executable
 ```sh
-chmod +x graphing
+sudo apt install build-essential curl unzip valgrind python3 python3-matplotlib linux-perf
 ```
 
-Run the script
+Then, in this folder:
+
 ```sh
-./graphing <path> <title (optional)>
+make -j8      # build the programs (a few minutes)
+make data     # download their input files (212 MB)
+nick=         # write a short name for your machine after the = (letters, digits, _)
 ```
+
+## Measure
+
+In this folder, with a laptop on its charger:
+
+```sh
+# quicksort (ours): sorts 10 million numbers
+sudo scripts/record all -n "$nick" build/quicksort 10000000
+# zstd: compresses a standard set of test files
+sudo scripts/record all -n "$nick" -q build/zstd -3 -c build/silesia
+# xz: compresses the same files
+sudo scripts/record all -n "$nick" -q build/xz -1 -c build/silesia
+# SQLite: its own speed test, on a database in memory
+sudo scripts/record all -n "$nick" build/speedtest1 --testset main --singlethread --size 100 :memory:
+# git: prints a small repository's history, with every change
+sudo scripts/record all -n "$nick" -q build/git -C build/repo log -p
+```
+
+`-q` throws away what the program prints. Wi-Fi and Bluetooth are off
+while the time is measured: over ssh on Wi-Fi, start these inside
+`screen` or `tmux`.
+
+Each run prints where its files went: `measurements/<program>/time/`
+and `count/` (SQLite's are under `speedtest1`). There is one CSV list
+each for instructions, lines and functions, most first.
+
+## If a run is cut off
+
+On Ctrl-C or an error, `record` puts the machine back by itself. If it
+was killed outright, the next `record` refuses to start. Then run:
+
+```sh
+sudo scripts/tune reset
+```
+
+## Scripts
+
+- `scripts/record` measures a program. It runs the other two for you.
+- `scripts/tune` sets the machine up for measuring, and back.
+- `scripts/rank` makes the ranked lists.
+- `scripts/graphing <list.csv> [title=<title>]` plots a list in a window.
+
+`scripts/record -h` shows its help; so do `rank` and `tune`.
 
 ---
 

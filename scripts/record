@@ -60,18 +60,23 @@
 #   <program>/count/...                  the same for counts
 #
 # A time run's files (<run> is e.g. t14-1.run1):
-#   <run>.samples.csv   the ranked instructions (see rank), all code,
-#                       kernel too
-#   <run>.meta.txt      what was run, how it was sampled, and the
-#                       program's output
-#   <run>.perf.data     raw samples
+#   <run>.samples.csv            the ranked instructions (see rank), all
+#                                code, kernel too
+#   <run>.line-samples.csv       the ranked source lines
+#   <run>.function-samples.csv   the ranked functions
+#   <run>.meta.txt               what was run, how it was sampled, and
+#                                the program's output
+#   <run>.perf.data              raw samples
 #
 # A count run's files:
-#   <run>.counts.csv      the ranked instructions (see rank), all
-#                         user-space code
-#   <run>.meta.txt        what was run, and the program's output
-#   <run>.callgrind.out   raw counts
-#   <run>.valgrind.log    load addresses, needed to rank the raw counts
+#   <run>.counts.csv            the ranked instructions (see rank), all
+#                               user-space code
+#   <run>.line-counts.csv       the ranked source lines
+#   <run>.function-counts.csv   the ranked functions
+#   <run>.meta.txt              what was run, and the program's output
+#   <run>.callgrind.out         raw counts and jumps
+#   <run>.valgrind.log          load addresses, needed to rank the raw
+#                               counts
 #
 # t14-1 is a platform: the system (t14) as it is now. When anything in
 # its platform file changes, new hardware or a kernel update say, the
@@ -530,6 +535,30 @@ meta_output() {
 }
 
 # finish_run: moves the run's files out of failed/ as <run>.<name>.
+# rank_run <mode> <raw> <second-arg> <what>: the run's three ranked
+# lists, <what>.csv, line-<what>.csv and function-<what>.csv; rank's
+# notes in rank.log, rank-lines.log and rank-functions.log
+rank_run() {
+	"$SCRIPTS/rank" "$1" instructions "$2" "$3" >"$STAGE/$4.csv" 2>"$STAGE/rank.log" ||
+		die "ranking failed: $(cat "$STAGE/rank.log")"
+	for level in line function; do
+		"$SCRIPTS/rank" "$1" "${level}s" "$2" "$3" >"$STAGE/$level-$4.csv" \
+			2>"$STAGE/rank-${level}s.log" ||
+			die "ranking by ${level}s failed: $(cat "$STAGE/rank-${level}s.log")"
+	done
+}
+
+# rank_levels <what>: meta.txt's lines on the line and function lists
+# (how many, and what rank left out); removes rank's notes on them
+rank_levels() {
+	for level in line function; do
+		printf '%-15s%s ranked' "${level}s:" "$(($(wc -l <"$STAGE/$level-$1.csv") - 1))"
+		sed -n 's/^left out/; left out/p' "$STAGE/rank-${level}s.log" | tr -d '\n'
+		echo ""
+		rm "$STAGE/rank-${level}s.log"
+	done
+}
+
 finish_run() {
 	for f in "$STAGE"/*; do
 		[ -e "$f" ] || continue
@@ -811,9 +840,7 @@ for an untuned baseline run."
 		clock_short="~$mhz MHz"
 	fi
 
-	"$SCRIPTS/rank" time "$STAGE/perf.data" "$BASE" \
-		>"$STAGE/samples.csv" 2>"$STAGE/rank.log" ||
-		die "ranking failed: $(cat "$STAGE/rank.log")"
+	rank_run time "$STAGE/perf.data" "$BASE" samples
 	rm "$STAGE/rank.log"
 	programs=$(awk -F, -v f="$BASE" 'NR > 1 && $NF == f' "$STAGE/samples.csv" | wc -l)
 	[ "$programs" -gt 0 ] ||
@@ -840,6 +867,7 @@ for an untuned baseline run."
 			echo "tuned:         no"
 		fi
 		echo "samples:       $nsamples, at $(($(wc -l <"$STAGE/samples.csv") - 1)) locations, $programs of them in $BASE"
+		rank_levels samples
 		echo "clock:         $clock"
 		echo "kernel:        $kernel% of the samples"
 		if [ -n "$BENCH" ]; then
@@ -909,13 +937,12 @@ record_count() {
 	# word splitting intended: ENVIRONMENT is a list of settings
 	env -i $ENVIRONMENT \
 		"$VALGRIND" -v -v -v --tool=callgrind --dump-instr=yes --skip-plt=no \
+		--collect-jumps=yes \
 		--callgrind-out-file="$STAGE/callgrind.out" --log-file="$STAGE/valgrind.log" \
 		"$PROG" "$@" >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" || status=$?
 	[ "$status" = 0 ] || program_failed "$status"
 
-	"$SCRIPTS/rank" count "$STAGE/callgrind.out" "$STAGE/valgrind.log" \
-		>"$STAGE/counts.csv" 2>"$STAGE/rank.log" ||
-		die "ranking failed: $(cat "$STAGE/rank.log")"
+	rank_run count "$STAGE/callgrind.out" "$STAGE/valgrind.log" counts
 	programs=$(awk -F, -v f="$BASE" 'NR > 1 && $NF == f' "$STAGE/counts.csv" | wc -l)
 	[ "$programs" -gt 0 ] ||
 		die "no counts for $BASE's own code; the object names in callgrind.out do not match it"
@@ -924,6 +951,7 @@ record_count() {
 		meta_common "$ARGS"
 		cat "$STAGE/rank.log"
 		echo "instructions:  $(($(wc -l <"$STAGE/counts.csv") - 1)) ran, $programs of them in $BASE"
+		rank_levels counts
 		meta_output
 	} >"$STAGE/meta.txt"
 	total=$(sed -n 's/^total Ir: //p' "$STAGE/rank.log")
