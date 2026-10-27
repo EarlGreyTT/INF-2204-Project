@@ -7,22 +7,28 @@
 # often each instruction runs (callgrind)
 #
 # Usage:
-#   record all -n <nick> [-r <runs>] [-u] [-c <cycles>] [-q] [-m <dir>]
-#              <program> [<arg>...]
-#   record time -n <nick> [-u] [-c <cycles>] [-q] [-m <dir>]
+#   record all -n <nick> -w <workload> [-r <runs>] [-u] [-c <cycles>] [-q]
+#              [-m <dir>] <program> [<arg>...]
+#   record time -n <nick> -w <workload> [-u] [-c <cycles>] [-q] [-m <dir>]
 #               <program> [<arg>...]
-#   record count -n <nick> [-q] [-m <dir>] <program> [<arg>...]
+#   record count -n <nick> -w <workload> [-q] [-m <dir>] <program>
+#                [<arg>...]
 #
 #   all          tune the system, record time <runs> times, restore the
 #                system, then record count once; as root
 #   time         sample where the program spends its CPU cycles, with
 #                perf, on the CPU that tune isolated; as root, with tune
 #                hold running in another terminal (or -u)
-#   count        count exactly how many times each instruction runs,
-#                with callgrind; needs no root or tuning
+#   count        count exactly how many times each instruction, source
+#                line and function runs, with callgrind; needs no root
+#                or tuning
 #
 #   -n <nick>    a nickname for the system measured on (hardware and
 #                software), e.g. t14
+#   -w <workload>
+#                a name for what is measured: the program with its
+#                settings and input, e.g. zstd-3-silesia; the folder its
+#                runs go in. Runs of another command need another name.
 #   -r <runs>    how many time runs to record (default 1)
 #   -u           untuned baseline: skip tune, run the program anywhere
 #   -c <cycles>  sampling period for perf (default 100003); fewer samples
@@ -48,16 +54,16 @@
 #
 # Time runs by hand, from two terminals:
 #   sudo scripts/tune hold
-#   sudo scripts/record time -n t14 ./build/quicksort 100000000
+#   sudo scripts/record time -n t14 -w quicksort-100m ./build/quicksort 100000000
 #
 # Layout under the measurements folder:
 #
 #   platforms/t14-1.txt                  the system: hardware, OS,
 #                                        versions, ...
-#   <program>/binaries/<hash>            each build of the program, once
-#   <program>/time/t14-1.run1.<file>     runs, numbered per platform
-#   <program>/time/failed/t14-1.run2/    a run that failed
-#   <program>/count/...                  the same for counts
+#   <workload>/binaries/<hash>           each build of the program, once
+#   <workload>/time/t14-1.run1.<file>    runs, numbered per platform
+#   <workload>/time/failed/t14-1.run2/   a run that failed
+#   <workload>/count/...                 the same for counts
 #
 # A time run's files (<run> is e.g. t14-1.run1):
 #   <run>.samples.csv            the ranked instructions (see rank), all
@@ -106,7 +112,20 @@ NAME=record
 # settings reach it
 ENVIRONMENT="PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C TZ=UTC"
 SCRIPTS=$(dirname "$(readlink -f "$0")")
-CMDLINE="$0 $*"
+
+# quote <word>: the word as the shell reads it back, in '' if needed
+quote() {
+	case "$1" in
+	"" | *[!A-Za-z0-9_./:=,+%@-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+# this command, to print as a fix
+CMDLINE=$(quote "$0")
+for a in "$@"; do
+	CMDLINE="$CMDLINE $(quote "$a")"
+done
 
 ROOT=
 PLATFORM=
@@ -117,6 +136,10 @@ BINARY=
 PROG=
 PROG_SHA=
 BASE=
+WORKLOAD=
+# set by -q: the program's output is thrown away
+DISCARD=
+ARGS=
 
 # records an error in the run being written, if there is one
 record_error() {
@@ -232,6 +255,40 @@ check_nick() {
 	"") die "a system nickname is required, e.g. -n t14" ;;
 	*[!A-Za-z0-9_]*) die "nickname '$1' may only contain letters, digits and _" ;;
 	esac
+}
+
+# check_workload name: a folder name of its own, not a path
+check_workload() {
+	case "$1" in
+	"") die "a workload name is required, e.g. -w zstd-3-silesia" ;;
+	platforms) die "'platforms' cannot be a workload's name: that folder holds the platform files" ;;
+	[!A-Za-z0-9]* | *[!A-Za-z0-9_.-]*) die "workload '$1' may only contain letters, digits, _ . and -, and must start with a letter or digit" ;;
+	esac
+}
+
+# check_command root: stops if the workload's earlier runs ran another
+# command (the program's file name, its arguments, and whether its
+# output was thrown away), so that runs of different settings or inputs
+# never mix under one name. An empty root means measurements/ in the
+# repo.
+check_command() {
+	this="$BASE $ARGS${DISCARD:+ (output discarded, -q)}"
+	for f in "${1:-$SCRIPTS/../measurements}/$WORKLOAD"/time/*.meta.txt \
+		"${1:-$SCRIPTS/../measurements}/$WORKLOAD"/count/*.meta.txt; do
+		[ -f "$f" ] || continue
+		that="$(sed -n 's/^program:       //p' "$f" | head -1) $(sed -n 's/^arguments:     //p' "$f" | head -1)"
+		if grep -q '^== program.out (discarded, -q)$' "$f"; then
+			that="$that (output discarded, -q)"
+		fi
+		if [ "$that" != "$this" ]; then
+			die "workload $WORKLOAD holds runs of:
+    $that
+(see $(shown "$f")), not of:
+    $this
+Give the new command its own name: with -w, or as the first word of
+its line in workloads.txt."
+		fi
+	done
 }
 
 # check_period cycles: a sampling period for perf, if one was given
@@ -357,7 +414,8 @@ last_number() {
 # STAGE, BINARY and PROG_SHA.
 start_run() {
 	ROOT=${1:-$SCRIPTS/../measurements}
-	for d in "$ROOT/platforms" "$ROOT/$BASE/binaries" "$ROOT/$BASE/$2/failed"; do
+	check_command "$ROOT"
+	for d in "$ROOT/platforms" "$ROOT/$WORKLOAD/binaries" "$ROOT/$WORKLOAD/$2/failed"; do
 		mkdir_own "$d"
 	done
 	ROOT=$(readlink -f "$ROOT")
@@ -389,7 +447,7 @@ start_run() {
 	fi
 
 	PROG_SHA=$(sha256sum "$PROG" | cut -d' ' -f1)
-	BINARY=$ROOT/$BASE/binaries/$(printf '%s' "$PROG_SHA" | cut -c1-12)
+	BINARY=$ROOT/$WORKLOAD/binaries/$(printf '%s' "$PROG_SHA" | cut -c1-12)
 	if [ ! -e "$BINARY" ]; then
 		cp "$PROG" "$BINARY"
 		own "$BINARY"
@@ -397,7 +455,7 @@ start_run() {
 		die "$BINARY exists but differs from $PROG"
 	fi
 
-	RUN_DIR=$ROOT/$BASE/$2
+	RUN_DIR=$ROOT/$WORKLOAD/$2
 	a=$(last_number "$RUN_DIR" "$PLATFORM.run" .meta.txt)
 	b=$(last_number "$RUN_DIR/failed" "$PLATFORM.run" "")
 	if [ "$b" -gt "$a" ]; then
@@ -503,12 +561,36 @@ noise_summary() {
 		}' "$1"
 }
 
+# repo_commit: the repo's commit, and whether what decides a run
+# (scripts/, the Makefile, workloads.txt) differs from it. Read-only:
+# --no-optional-locks keeps git status from rewriting the index as root,
+# and safe.directory lets root read the user's repo.
+repo_commit() {
+	repo=$(dirname "$SCRIPTS")
+	g() {
+		git -c safe.directory="$repo" -C "$repo" --no-optional-locks "$@" 2>/dev/null
+	}
+	if ! c=$(g rev-parse --short=12 HEAD); then
+		echo "unknown (not a git checkout)"
+	elif [ -n "$(g status --porcelain -- scripts Makefile workloads.txt)" ]; then
+		echo "$c, with changes not committed in scripts/, the Makefile or workloads.txt"
+	else
+		echo "$c"
+	fi
+}
+
 # The lines every meta.txt starts with. Takes the program's arguments.
 meta_common() {
 	echo "run:           $RUN"
+	echo "workload:      $WORKLOAD"
 	echo "date:          $(date -Iseconds)"
+	echo "repo commit:   $(repo_commit)"
 	echo "platform:      $PLATFORM (see platforms/$PLATFORM.txt)"
-	echo "command:       $PROG $*"
+	# printf: echo would turn a \t in an argument into a tab
+	printf 'command:       %s %s\n' "$PROG" "$*"
+	# the two that make up the workload, the same on every machine
+	printf 'program:       %s\n' "$BASE"
+	printf 'arguments:     %s\n' "$*"
 	echo "binary:        sha256 $PROG_SHA, stored as binaries/$(basename "$BINARY")"
 	echo "compiler:      $(readelf -p .comment "$PROG" 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | head -1)"
 	# from the debug information of the program's first source file: the
@@ -534,10 +616,10 @@ meta_output() {
 	done
 }
 
-# finish_run: moves the run's files out of failed/ as <run>.<name>.
 # rank_run <mode> <raw> <second-arg> <what>: the run's three ranked
 # lists, <what>.csv, line-<what>.csv and function-<what>.csv; rank's
-# notes in rank.log, rank-lines.log and rank-functions.log
+# notes in rank.log, rank-lines.log and rank-functions.log, its warnings
+# also on the terminal and in rank-warnings
 rank_run() {
 	"$SCRIPTS/rank" "$1" instructions "$2" "$3" >"$STAGE/$4.csv" 2>"$STAGE/rank.log" ||
 		die "ranking failed: $(cat "$STAGE/rank.log")"
@@ -546,10 +628,14 @@ rank_run() {
 			2>"$STAGE/rank-${level}s.log" ||
 			die "ranking by ${level}s failed: $(cat "$STAGE/rank-${level}s.log")"
 	done
+	# the three levels read the same files, so mostly the same warnings
+	sort -u "$STAGE/rank.log" "$STAGE"/rank-*s.log | sed -n 's/^warning: //p' >"$STAGE/rank-warnings"
+	sed "s/^/$NAME: warning: /" "$STAGE/rank-warnings" >&2
 }
 
 # rank_levels <what>: meta.txt's lines on the line and function lists
-# (how many, and what rank left out); removes rank's notes on them
+# (how many, and what rank left out), and rank's warnings; removes
+# rank's notes on them
 rank_levels() {
 	for level in line function; do
 		printf '%-15s%s ranked' "${level}s:" "$(($(wc -l <"$STAGE/$level-$1.csv") - 1))"
@@ -557,8 +643,11 @@ rank_levels() {
 		echo ""
 		rm "$STAGE/rank-${level}s.log"
 	done
+	sed 's/^/warning:       /' "$STAGE/rank-warnings"
+	rm "$STAGE/rank-warnings"
 }
 
+# finish_run: moves the run's files out of failed/ as <run>.<name>.
 finish_run() {
 	for f in "$STAGE"/*; do
 		[ -e "$f" ] || continue
@@ -578,13 +667,15 @@ record_all() {
 	PERIOD=
 	QUIET=
 	MDIR=
-	while getopts n:r:uc:qm: opt; do
+	while getopts hn:w:r:uc:qm: opt; do
 		case "$opt" in
+		h) usage 0 ;;
 		n) NICK=$OPTARG ;;
+		w) WORKLOAD=$OPTARG ;;
 		r) RUNS=$OPTARG ;;
 		u) UNTUNED=-u ;;
 		c) PERIOD=$OPTARG ;;
-		q) QUIET=-q ;;
+		q) QUIET=-q; DISCARD=1 ;;
 		m) MDIR=$OPTARG ;;
 		*) usage ;;
 		esac
@@ -592,15 +683,19 @@ record_all() {
 	shift $((OPTIND - 1))
 	[ $# -ge 1 ] || usage
 	check_nick "$NICK"
+	check_workload "$WORKLOAD"
 	case "$RUNS" in
 	"" | *[!0-9]* | 0*) die "-r takes a positive number of runs, got '$RUNS'" ;;
 	esac
 	check_period "$PERIOD"
-	# checked here too, so a bad path fails before the system is tuned
+	# checked here too, so that these fail before the system is tuned
 	check_program "$1"
+	ARGS=$(shift; printf '%s' "$*")
+	check_command "$MDIR"
 
 	need_root "tuning and perf need it"
-	if [ -z "$UNTUNED" ] && [ -f /run/tune.state ]; then
+	# also with -u: record time -u refuses a tuned system
+	if [ -f /run/tune.state ]; then
 		die_cmd "the system is already tuned, by something other than this run" \
 			"sudo $SCRIPTS/tune reset" \
 			"or, if tune is running in another terminal, stop it with Ctrl-C."
@@ -639,7 +734,7 @@ record_all() {
 			TUNED=0
 			tune_system
 		fi
-		"$SCRIPTS/record" time -n "$NICK" $UNTUNED \
+		"$SCRIPTS/record" time -n "$NICK" -w "$WORKLOAD" $UNTUNED \
 			${PERIOD:+-c} ${PERIOD:+"$PERIOD"} $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@" ||
 			failed=$((failed + 1))
 		i=$((i + 1))
@@ -647,9 +742,9 @@ record_all() {
 	untune
 
 	if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
-		set -- sudo -u "$SUDO_USER" -- "$SCRIPTS/record" count -n "$NICK" $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
+		set -- sudo -u "$SUDO_USER" -- "$SCRIPTS/record" count -n "$NICK" -w "$WORKLOAD" $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
 	else
-		set -- "$SCRIPTS/record" count -n "$NICK" $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
+		set -- "$SCRIPTS/record" count -n "$NICK" -w "$WORKLOAD" $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
 	fi
 	"$@" || failed=$((failed + 1))
 
@@ -664,12 +759,14 @@ record_time() {
 	MDIR=
 	UNTUNED=0
 	OUT=
-	while getopts n:uc:qm: opt; do
+	while getopts hn:w:uc:qm: opt; do
 		case "$opt" in
+		h) usage 0 ;;
 		n) NICK=$OPTARG ;;
+		w) WORKLOAD=$OPTARG ;;
 		u) UNTUNED=1 ;;
 		c) PERIOD=$OPTARG ;;
-		q) OUT=/dev/null ;;
+		q) OUT=/dev/null; DISCARD=1 ;;
 		m) MDIR=$OPTARG ;;
 		*) usage ;;
 		esac
@@ -677,6 +774,7 @@ record_time() {
 	shift $((OPTIND - 1))
 	[ $# -ge 1 ] || usage
 	check_nick "$NICK"
+	check_workload "$WORKLOAD"
 	check_period "$PERIOD"
 	check_program "$1"
 	shift
@@ -901,10 +999,12 @@ record_count() {
 	NICK=
 	MDIR=
 	OUT=
-	while getopts n:qm: opt; do
+	while getopts hn:w:qm: opt; do
 		case "$opt" in
+		h) usage 0 ;;
 		n) NICK=$OPTARG ;;
-		q) OUT=/dev/null ;;
+		w) WORKLOAD=$OPTARG ;;
+		q) OUT=/dev/null; DISCARD=1 ;;
 		m) MDIR=$OPTARG ;;
 		*) usage ;;
 		esac
@@ -912,6 +1012,7 @@ record_count() {
 	shift $((OPTIND - 1))
 	[ $# -ge 1 ] || usage
 	check_nick "$NICK"
+	check_workload "$WORKLOAD"
 	check_program "$1"
 	shift
 	ARGS="$*"
@@ -949,7 +1050,7 @@ record_count() {
 
 	{
 		meta_common "$ARGS"
-		cat "$STAGE/rank.log"
+		sed '/^warning: /d' "$STAGE/rank.log"
 		echo "instructions:  $(($(wc -l <"$STAGE/counts.csv") - 1)) ran, $programs of them in $BASE"
 		rank_levels counts
 		meta_output
@@ -968,6 +1069,9 @@ case "${1:-}" in
 all | time | count)
 	cmd=$1
 	shift
+	case "${1:-}" in
+	-h | --help) usage 0 ;;
+	esac
 	"record_$cmd" "$@"
 	;;
 *)

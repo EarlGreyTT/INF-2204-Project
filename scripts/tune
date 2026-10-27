@@ -44,7 +44,7 @@
 # out-of-distro packages).
 # Assumes /sys/devices/system/cpu/present is a contiguous range "0-N".
 # Boot-time isolation (isolcpus=, nohz_full=, rcu_nocbs=) needs a
-# reboot, so it is only suggested; put it in a separate boot entry.
+# reboot, so it is only suggested; the README says where it goes.
 
 set -eu
 
@@ -154,6 +154,34 @@ expand_cpulist() {
 		*) echo "$tok" ;;
 		esac
 	done
+}
+
+# boot_covers <option> <cpu>: whether the kernel was booted with the
+# option for that CPU. isolcpus can have flags before the CPUs
+# (isolcpus=domain,managed_irq,3); =all is every CPU. An option without
+# a list covers no CPU (rcu_nocbs alone offloads none at boot, per the
+# kernel's documentation), and neither does a list in another form
+# (0-7:2/4): then the hint is printed.
+boot_covers() {
+	# no globbing: the words are the kernel's, not file names
+	set -f
+	words=$(cat /proc/cmdline)
+	set +f
+	for w in $words; do
+		case "$w" in
+		"$1=all") return 0 ;;
+		"$1="*) ;;
+		*) continue ;;
+		esac
+		list=$(echo "${w#*=}" | sed 's/^\([a-z_]*,\)*//')
+		case "$list" in
+		"" | *[!0-9,-]* | *--* | -* | *-) continue ;;
+		esac
+		for c in $(expand_cpulist "$list"); do
+			[ "$c" != "$2" ] || return 0
+		done
+	done
+	return 1
 }
 
 # /proc/irq/default_smp_affinity takes a hex bitmask (there is no _list
@@ -454,7 +482,7 @@ set_verify() {
 }
 
 preflight() {
-	[ "$(id -u)" = 0 ] || die "must run as root"
+	[ "$(id -u)" = 0 ] || die_cmd "must run as root" "sudo $0 $ARGS"
 
 	for c in systemctl systemd-run awk sed sort tr; do
 		have "$c" || die "missing required command: $c"
@@ -709,7 +737,7 @@ auto_select() {
 		fi
 	done
 	if [ "$best" = 0 ]; then
-		die "auto-selected core is core 0 -- pass a CPU explicitly"
+		die "the auto-selected core is core 0, which cannot be isolated; run tune by hand with another CPU (see tune -h), or use a machine with more cores"
 	fi
 	echo "$best"
 }
@@ -723,19 +751,22 @@ trap 'exit 143' TERM
 # Ignored, the message just fails.
 trap '' PIPE
 
+# the arguments, for a fix to print (checked before any is printed:
+# a mode and a CPU number)
+ARGS=$*
 case "${1:-}" in
 -h | --help)
 	usage 0
 	;;
 check)
 	[ $# -eq 1 ] || usage
-	[ "$(id -u)" = 0 ] || die "must run as root"
+	[ "$(id -u)" = 0 ] || die_cmd "must run as root" "sudo $0 $ARGS"
 	report
 	exit 0
 	;;
 reset)
 	[ $# -eq 1 ] || usage
-	[ "$(id -u)" = 0 ] || die "must run as root"
+	[ "$(id -u)" = 0 ] || die_cmd "must run as root" "sudo $0 $ARGS"
 	do_reset || die_cmd "the system is not restored in full" \
 		"sudo $0 reset" \
 		"If something cannot come back, give up on it with:
@@ -1013,10 +1044,7 @@ if [ ! -d /sys/devices/system/cpu/intel_pstate ] && [ -e /sys/devices/system/cpu
 fi
 missing=
 for p in $params; do
-	case " $(cat /proc/cmdline) " in
-	*" $p="*) ;;
-	*) missing="$missing $p=$BENCH" ;;
-	esac
+	boot_covers "$p" "$BENCH" || missing="$missing $p=$BENCH"
 done
 
 case "$PINNED" in
@@ -1042,7 +1070,7 @@ if [ "$HOLD" = 1 ]; then
 	echo "$BENCH"
 	note "holding; record from another terminal, e.g.:"
 	note ""
-	note "sudo $(dirname "$0")/record time -n <nick> <program>"
+	note "sudo $(dirname "$0")/record time -n <nick> -w <workload> <program>"
 	note ""
 	note "press Ctrl-C here when done, to restore the system"
 	note "(closing this terminal restores it too)"

@@ -23,7 +23,7 @@ Usage:
   -a        instead of the ranking: <function>'s disassembly, each
             instruction with its samples or count
   -b        disassemble <binary>, a stored copy of the program (e.g.
-            measurements/<program>/binaries/<hash>), instead of the file
+            measurements/<workload>/binaries/<hash>), instead of the file
             at the recorded path, which the next build overwrites
 
 Prints CSV, most first, ties ordered by name so the ranks are the same
@@ -154,10 +154,10 @@ def rank_time(data, comm):
             if (path, ip) not in where:
                 die(f"perf script gave no file offset for {ip:#x} in {path}")
             func = f"{func}[{to_address(segs[path], where[(path, ip)]) - off:#x}]"
-        loc[(func, off, os.path.basename(path))] += n
+        loc[(func, off, file_name(path))] += n
     for (path, ip), n in unnamed.items():
         a = to_address(segs[path], where[(path, ip)]) if (path, ip) in where else None
-        loc[("[unknown]", ip if a is None else a, os.path.basename(path))] += n
+        loc[("[unknown]", ip if a is None else a, file_name(path))] += n
     return loc
 
 
@@ -179,8 +179,10 @@ def time_samples(data, comm):
         elif not path.startswith("["):
             if path not in usable:
                 usable[path] = is_elf(path) and build_id(path) == ids.get(path)
-                # a kernel module's file (not ELF) is the kernel's: no lines
-                if not usable[path] and (is_elf(path) or not os.path.exists(path)):
+                # a kernel module's file (not ELF) is the kernel's: no lines;
+                # so is /proc/kcore, perf's name for the kernel as root
+                if (not usable[path] and path != "/proc/kcore"
+                        and (is_elf(path) or not os.path.exists(path))):
                     print(f"warning: {path} is gone or changed since the run (build-id "
                           f"differs): its samples have no lines", file=sys.stderr)
             if usable[path]:
@@ -208,7 +210,7 @@ def rank_time_source(data, comm, level):
                 left += n
     for (path, func), n in rest.items():
         if level == "functions" and func != "[unknown]":
-            loc[(func, "", os.path.basename(path))] += n
+            loc[(func, "", file_name(path))] += n
         else:
             left += n
     total = sum(loc.values()) + left
@@ -273,6 +275,19 @@ def is_elf(path):
         return False
 
 
+def file_name(path):
+    """The file column of a time row. perf names a kernel module [name],
+    or by its file (on the Pi: .../btrfs.ko.xz); both give [btrfs], so
+    that kernel code is always in brackets. As root perf names the kernel
+    itself /proc/kcore: that is [kernel.kallsyms], as in the instruction
+    lists."""
+    if path == "/proc/kcore":
+        return "[kernel.kallsyms]"
+    if m := re.fullmatch(r"(.+)\.ko(?:\.[a-z0-9]+)?", os.path.basename(path)):
+        return f"[{m[1].replace('-', '_')}]"
+    return os.path.basename(path)
+
+
 def build_id(path):
     m = re.search(r"Build ID: ([0-9a-f]+)", run("readelf", "-n", path))
     return m and m[1]
@@ -308,8 +323,10 @@ def decode(path):
       from (fi= alone). Each function (fn=) starts in its own file, the
       last fl=; an fi=/fe= right before a call is the call's, not the
       following cost lines'.
-    - With line 0 there is no debug information, and callgrind names no
-      file.
+    - With line 0 there is no debug information, and the file id says
+      nothing: callgrind writes such a count under the function's file,
+      but a jump or call from the same instruction under "???". The key
+      has no file then (None), so that both find the same instruction.
     Where the data does not tell, count_addresses decides.
 
     A jump (jump=, jcnd=) is written as its target, then a line with its
@@ -331,6 +348,10 @@ def decode(path):
     total = None
     cost, jumps, calls = Counter(), Counter(), Counter()
 
+    def at(p, file):
+        n = p[line] if line is not None else 0
+        return (file if n else None, n, ob, p[instr])
+
     def in_object(id, o):
         if fileob.setdefault(id, o) != o:
             die(f"{path}: source file ({id}) is in two objects, {fileob[id]} and {o}")
@@ -344,16 +365,12 @@ def decode(path):
             if skip:
                 # written relative to the last position, like any cost
                 # line, but callgrind does not move on from it
-                src = moved(pos, l.split())
-                key = (switch or file, src[line] if line is not None else 0, ob, src[instr])
-                calls[(key, call[0], call[1])] += call[2]
+                calls[(at(moved(pos, l.split()), switch or file), call[0], call[1])] += call[2]
                 cob, skip = None, False
                 continue
             tok = l.split()
             if jump:
-                src = moved(pos, tok)
-                key = (switch or file, src[line] if line is not None else 0, ob, src[instr])
-                jumps[(key, jump[0])] += jump[1]
+                jumps[(at(moved(pos, tok), switch or file), jump[0])] += jump[1]
                 jump = None
                 continue
             pos[:] = moved(pos, tok)
@@ -361,7 +378,7 @@ def decode(path):
             if len(tok) > col:
                 if switch:
                     file, switch = switch, None
-                cost[(file, pos[line] if line is not None else 0, ob, pos[instr])] += int(tok[col])
+                cost[at(pos, file)] += int(tok[col])
         elif m := re.match(r"(c?)ob=(?:\((\d+)\))? ?(.*)", l.rstrip("\n")):
             callee, id, name = m.groups()
             if name:
@@ -735,10 +752,14 @@ def rank_count_source(out, log, level):
             elif level == "functions":
                 # GCC can split a function: a small head, often inlined,
                 # calls the rest, f.part.N. The run began at the head.
+                # A head that jumps to the rest (jmp, b) is written as a
+                # call too, but flow already made that jump one inside f:
+                # not an entry, so nothing to take away.
                 loc[key] += entries(blocks, ran, pred) - sum(
                     n for (a, t), n in split_calls.items()
                     if block.get(t) in blocks and symbol_at(table, t)[2].startswith(key[0] + ".part.")
-                    and any(f[0] == key[0] for f, _ in places[a][1]))
+                    and any(f[0] == key[0] for f, _ in places[a][1])
+                    and not (block[a] in blocks and DIRECT_JUMP.match(instructions(ob)[0].get(a, ""))))
             else:
                 loc[key] += entries(blocks, ran, pred)
             if level == "lines":
@@ -1051,6 +1072,10 @@ def read_symbols(path):
         if len(f) != 4 or f[2] not in "TtWwi":
             continue
         start, size, kind, name = int(f[0], 16), int(f[1], 16), f[2], f[3]
+        if src[0] == "-D":
+            # nm adds the version to exported names (printf@@GLIBC_2.2.5);
+            # perf shows the name alone
+            name = name.split("@")[0]
         # Of several names for one address, pick the one perf shows:
         # sized, strong over weak, global over local, fewest leading
         # underscores, longest.
@@ -1170,7 +1195,7 @@ def usage(status=1):
 
 
 def main(argv):
-    if len(argv) == 1 and argv[0] in ("-h", "--help"):
+    if any(a in ("-h", "--help") for a in argv[:2]):
         usage(0)
     if not argv or argv[0] not in ("time", "count"):
         usage()

@@ -7,7 +7,8 @@
 # options in force in each run's meta.txt.
 #
 #   make             everything
-#   make <program>   one program: quicksort, zstd, xz, sqlite or git
+#   make <program>   one program: quicksort, zstd, xz, sqlite, git or
+#                    magick (ImageMagick)
 #   make data        the files the programs are run on:
 #                    build/silesia  for zstd and xz: the Silesia corpus,
 #                                   a standard test set for compression,
@@ -15,6 +16,11 @@
 #                                   the download is slow)
 #                    build/repo     for git: a repository whose three
 #                                   commits are three releases of git
+#                    build/bridge.ppm
+#                                   for ImageMagick: a photo from a set
+#                                   of test photos used in image
+#                                   compression research (the download,
+#                                   346 MB, is of the whole set)
 #   make clean       remove build/
 #
 # Third-party programs: a pinned release, its download checked against
@@ -85,6 +91,11 @@ GIT_SHA256_$(GIT_VERSION) = $(GIT_SHA256)
 GIT_REPO_HEAD = ccca0fc07216649845016dead9dec9bc94967c38
 GIT_REPO_PACK_SHA256 = 3a0f047a10d5ebe1666ec38bf240c60b5855fa2fcc7cd5fad953ae08fe52d268
 
+MAGICK_VERSION = 7.1.2-34
+MAGICK_SHA256 = 55fe0ec246245b46c429f9e6bc65294ad4a78a66b88abd9817971ca157856323
+MAGICK_URL = https://github.com/ImageMagick/ImageMagick/releases/download/$(MAGICK_VERSION)/ImageMagick-$(MAGICK_VERSION).tar.xz
+MAGICK_SRC = $(BUILD)/ImageMagick-$(MAGICK_VERSION)
+
 # for git, instead of the system's
 ZLIB_VERSION = 1.3.2
 ZLIB_SHA256 = bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
@@ -96,14 +107,20 @@ ZLIB_SRC = $(BUILD)/zlib-$(ZLIB_VERSION)
 SILESIA_SHA256 = 0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af
 SILESIA_URL = https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
 
-all: quicksort zstd xz sqlite git
+# no published checksum either: the SHA-256 of our first download
+# (2026-10-26)
+IMAGES_SHA256 = 16c273504425923259b1ddf8e39dfa9cb27585d249f6263cfc6bea39cfafa660
+IMAGES_URL = https://imagecompression.info/test_images/rgb8bit.zip
+
+all: quicksort zstd xz sqlite git magick
 
 quicksort: $(BUILD)/quicksort
 zstd: $(BUILD)/zstd
 xz: $(BUILD)/xz
 sqlite: $(BUILD)/speedtest1
 git: $(BUILD)/git
-data: $(BUILD)/silesia $(BUILD)/repo
+magick: $(BUILD)/magick
+data: $(BUILD)/silesia $(BUILD)/repo $(BUILD)/bridge.ppm
 
 # fetch url sha256: downloads to $@, kept only if the checksum matches
 define fetch
@@ -162,6 +179,33 @@ $(BUILD)/speedtest1: $(BUILD)/sqlite-src-$(SQLITE_VERSION).zip Makefile
 	$(BUILDENV) $(MAKE) -C $(SQLITE_SRC) sqlite3.c >/dev/null
 	$(BUILDENV) $(CC) $(CFLAGS) -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -I$(SQLITE_SRC) \
 		-o $@ $(SQLITE_SRC)/test/speedtest1.c $(SQLITE_SRC)/sqlite3.c -lm
+
+$(BUILD)/ImageMagick-$(MAGICK_VERSION).tar.xz: | $(BUILD)
+	$(call fetch,$(MAGICK_URL),$(MAGICK_SHA256))
+
+# The magick program with all of ImageMagick built in (no shared
+# libraries). Every library it could use is off, so it reads and writes
+# only the formats it has code for itself (PPM, BMP, ...). No threads
+# (OpenMP, pthreads), no X, no C++ or Perl parts. Zero configuration:
+# it reads no settings files, and the prefix is a folder that does not
+# exist, as for git. Pixels are ImageMagick 7's default kind: floats
+# on a 16-bit scale (Q16 HDRI). --without-gcc-arch stops configure
+# adding a -mtune of its own; it still adds -fexceptions, on every
+# platform alike.
+$(BUILD)/magick: $(BUILD)/ImageMagick-$(MAGICK_VERSION).tar.xz Makefile
+	rm -rf $(MAGICK_SRC)
+	tar -xJf $< -C $(BUILD)
+	cd $(MAGICK_SRC) && $(BUILDENV) ./configure --quiet CC="$(CC)" CFLAGS="$(CFLAGS)" --prefix=/nonexistent \
+		--disable-shared --enable-zero-configuration --with-quantum-depth=16 --enable-hdri \
+		--disable-openmp --disable-opencl --without-threads --without-gcc-arch \
+		--without-modules --without-magick-plus-plus --without-perl --without-x --disable-docs --disable-dpc \
+		--without-bzlib --without-zip --without-zlib --without-zstd --without-lzma \
+		--without-djvu --without-dmr --without-fontconfig --without-freetype --without-heic \
+		--without-jbig --without-jpeg --without-jxl --without-lcms --without-lqr --without-openexr \
+		--without-openjp2 --without-pango --without-png --without-raqm --without-raw --without-tiff \
+		--without-webp --without-xml
+	$(BUILDENV) $(MAKE) -C $(MAGICK_SRC) utilities/magick >/dev/null
+	cp $(MAGICK_SRC)/utilities/magick $@
 
 $(BUILD)/zlib-$(ZLIB_VERSION).tar.gz: | $(BUILD)
 	$(call fetch,$(ZLIB_URL),$(ZLIB_SHA256))
@@ -230,10 +274,18 @@ $(BUILD)/silesia: $(BUILD)/silesia.zip
 	unzip -p $< > $@.part
 	mv $@.part $@
 
+$(BUILD)/rgb8bit.zip: | $(BUILD)
+	$(call fetch,$(IMAGES_URL),$(IMAGES_SHA256))
+
+# one photo of a common size: 2749 x 4049 pixels (11 megapixels)
+$(BUILD)/bridge.ppm: $(BUILD)/rgb8bit.zip
+	unzip -p $< bridge.ppm > $@.part
+	mv $@.part $@
+
 $(BUILD):
 	mkdir -p $@
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all quicksort zstd xz sqlite git data clean
+.PHONY: all quicksort zstd xz sqlite git magick data clean

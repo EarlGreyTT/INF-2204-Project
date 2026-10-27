@@ -9,21 +9,19 @@ that spread across programs and machines.
 Install the tools. On Ubuntu:
 
 ```sh
-sudo apt install build-essential curl unzip valgrind python3 python3-matplotlib linux-tools-common linux-tools-$(uname -r)
+sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-matplotlib linux-tools-common linux-tools-$(uname -r)
 ```
 
 On Debian or Raspberry Pi OS:
 
 ```sh
-sudo apt install build-essential curl unzip valgrind python3 python3-matplotlib linux-perf
+sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-matplotlib linux-perf
 ```
 
-Then, in this folder:
+Name your machine (letters, digits, _; the same name every time):
 
 ```sh
-make -j8      # build the programs (a few minutes)
-make data     # download their input files (212 MB)
-nick=         # write a short name for your machine after the = (letters, digits, _)
+export nick=
 ```
 
 ## Measure
@@ -31,30 +29,29 @@ nick=         # write a short name for your machine after the = (letters, digits
 In this folder, with a laptop on its charger:
 
 ```sh
-# quicksort (ours): sorts 10 million numbers
-sudo scripts/record all -n "$nick" build/quicksort 10000000
-# zstd: compresses a standard set of test files
-sudo scripts/record all -n "$nick" -q build/zstd -3 -c build/silesia
-# xz: compresses the same files
-sudo scripts/record all -n "$nick" -q build/xz -1 -c build/silesia
-# SQLite: its own speed test, on a database in memory
-sudo scripts/record all -n "$nick" build/speedtest1 --testset main --singlethread --size 100 :memory:
-# git: prints a small repository's history, with every change
-sudo scripts/record all -n "$nick" -q build/git -C build/repo log -p
+sudo scripts/measure -n "$nick" all
 ```
 
-`-q` throws away what the program prints. Wi-Fi and Bluetooth are off
-while the time is measured: over ssh on Wi-Fi, start these inside
-`screen` or `tmux`.
+This builds the programs, downloads their inputs (440 MB) and measures
+each workload in `workloads.txt`. Wi-Fi and Bluetooth are off during
+the time runs: over ssh on Wi-Fi, run it inside `screen`. If it stops
+early, it prints a command that runs the workloads it did not finish.
+Results go to `measurements/<workload>/`.
 
-Each run prints where its files went: `measurements/<program>/time/`
-and `count/` (SQLite's are under `speedtest1`). There is one CSV list
-each for instructions, lines and functions, most first.
+## Cleaner measurements
 
-## If a run is cut off
+`tune` prints kernel boot options that keep other work off the
+measured CPU, e.g. `tune: for full isolation, also boot with isolcpus=3
+rcu_nocbs=3`. Add them, then reboot:
 
-On Ctrl-C or an error, `record` puts the machine back by itself. If it
-was killed outright, the next `record` refuses to start. Then run:
+- Ubuntu: inside the quotes of `GRUB_CMDLINE_LINUX_DEFAULT` in
+  `/etc/default/grub`, then run `sudo update-grub`.
+- Raspberry Pi OS: at the end of the one line in
+  `/boot/firmware/cmdline.txt`, after a space; it must stay one line.
+
+## If measure or record refuses to start
+
+If a run was killed outright, the machine may still be tuned:
 
 ```sh
 sudo scripts/tune reset
@@ -62,12 +59,13 @@ sudo scripts/tune reset
 
 ## Scripts
 
-- `scripts/record` measures a program. It runs the other two for you.
-- `scripts/tune` sets the machine up for measuring, and back.
-- `scripts/rank` makes the ranked lists.
-- `scripts/graphing <list.csv> [title=<title>]` plots a list in a window.
+- `measure`: builds the programs and measures every workload.
+- `record`: measures one program.
+- `tune`: sets the machine up for measuring, and back.
+- `rank`: makes the ranked lists.
+- `graphing <list.csv>`: plots a list in a window.
 
-`scripts/record -h` shows its help; so do `rank` and `tune`.
+All are in `scripts/`. The first four show their help with `-h`.
 
 ---
 
