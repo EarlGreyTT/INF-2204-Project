@@ -9,6 +9,9 @@
 #   make             everything
 #   make <program>   one program: quicksort, zstd, xz, sqlite, git or
 #                    magick (ImageMagick)
+#   make clang       the C compilers, built from source: build/clang and
+#   make gcc         build/cc1 (gcc's compiler proper). Not part of
+#                    "make": each takes hours on a Raspberry Pi.
 #   make data        the files the programs are run on:
 #                    build/silesia  for zstd and xz: the Silesia corpus,
 #                                   a standard test set for compression,
@@ -44,6 +47,17 @@ CFLAGS = -O2 -g -falign-functions=32 -falign-loops=32 -ffile-prefix-map=$(CURDIR
 # Off everywhere, so the platforms build the same kind of code.
 CFLAGS += -fno-stack-protector -fno-stack-clash-protection -fcf-protection=none \
 	-U_FORTIFY_SOURCE -Wl,-z,lazy
+
+# The compilers are C++ and built by this one. They get the flags above
+# with -g1 for -g: functions and source lines, which is all perf needs,
+# without the types and variables, which for programs this size take
+# gigabytes more memory and disk to build. -g1 does not change the code
+# either.
+CXX = g++
+COMPILER_CFLAGS = $(patsubst -g,-g1,$(CFLAGS))
+# how many files ninja (clang's build) compiles at once; it does not take
+# make's -j. Some of clang's files need 1-2 GB of memory each.
+COMPILER_JOBS = 4
 
 ifneq ($(words $(CURDIR)),1)
 $(error the path of this folder has a space in it ($(CURDIR)), which the builds cannot handle)
@@ -102,6 +116,31 @@ ZLIB_SHA256 = bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16
 ZLIB_URL = https://github.com/madler/zlib/releases/download/v$(ZLIB_VERSION)/zlib-$(ZLIB_VERSION).tar.gz
 ZLIB_SRC = $(BUILD)/zlib-$(ZLIB_VERSION)
 
+# LLVM signs its releases but publishes no checksum: this is the
+# SHA-256 of our first download (2026-10-29)
+LLVM_VERSION = 23.1.4
+LLVM_SHA256 = 819ecf7351f1a66f76b2d701d8942faaf5faeb324cb90c9d5b090de142434bb2
+LLVM_URL = https://github.com/llvm/llvm-project/releases/download/llvmorg-$(LLVM_VERSION)/llvm-project-$(LLVM_VERSION).src.tar.xz
+LLVM_SRC = $(BUILD)/llvm-project-$(LLVM_VERSION).src
+
+# gnu.org publishes SHA-512 (in sha512.sum, which our download matched
+# on 2026-10-29); this is that download's SHA-256
+GCC_VERSION = 16.2.0
+GCC_SHA256 = e6738e29597f733270731aa90600f37ffdc045079dfc27ec7e8192cc81085c3e
+GCC_URL = https://ftp.gnu.org/gnu/gcc/gcc-$(GCC_VERSION)/gcc-$(GCC_VERSION).tar.xz
+GCC_SRC = $(BUILD)/gcc-$(GCC_VERSION)
+
+# the libraries gcc needs for arithmetic on constants: the versions and
+# server named in its contrib/download_prerequisites (our downloads
+# matched its SHA-512s in contrib/prerequisites.sha512); SHA-256 of those
+GCC_INFRA_URL = https://gcc.gnu.org/pub/gcc/infrastructure
+GMP_VERSION = 6.3.0
+GMP_SHA256 = ac28211a7cfb609bae2e2c8d6058d66c8fe96434f740cf6fe2e47b000d1c20cb
+MPFR_VERSION = 4.2.2
+MPFR_SHA256 = 9ad62c7dc910303cd384ff8f1f4767a655124980bb6d8650fe62c815a231bb7b
+MPC_VERSION = 1.3.1
+MPC_SHA256 = ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8
+
 # no published checksum: this is the SHA-256 of our first download
 # (2026-09-27)
 SILESIA_SHA256 = 0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af
@@ -120,6 +159,8 @@ xz: $(BUILD)/xz
 sqlite: $(BUILD)/speedtest1
 git: $(BUILD)/git
 magick: $(BUILD)/magick
+clang: $(BUILD)/clang
+gcc: $(BUILD)/cc1
 data: $(BUILD)/silesia $(BUILD)/repo $(BUILD)/bridge.ppm
 
 # fetch url sha256: downloads to $@, kept only if the checksum matches
@@ -266,6 +307,74 @@ $(BUILD)/repo: $(BUILD)/git $(foreach v,$(GIT_OLDER) $(GIT_VERSION),$(BUILD)/git
 	echo "$(GIT_REPO_PACK_SHA256)  $$(echo .git/objects/pack/*.pack)" | sha256sum -c --quiet
 	mv $@.part $@
 
+$(BUILD)/llvm-project-$(LLVM_VERSION).src.tar.xz: | $(BUILD)
+	$(call fetch,$(LLVM_URL),$(LLVM_SHA256))
+
+# Only clang, as one program: LLVM's libraries linked in statically, and
+# the C++ library too. Code generation only for the machine it is built
+# on (LLVM_TARGETS_TO_BUILD=host; AArch64 on a Raspberry Pi), as gcc
+# does. A release build (no assertions) at -O2: cmake's Release would
+# add -O3. Optional libraries off (zlib, zstd, libxml2, libedit, libpfm,
+# curl, libffi), so it takes none from the system, and so are the
+# static analyzer, tests, examples and documentation. Needs cmake and
+# ninja (apt install cmake ninja-build).
+$(BUILD)/clang: $(BUILD)/llvm-project-$(LLVM_VERSION).src.tar.xz Makefile
+	rm -rf $(LLVM_SRC) $(BUILD)/llvm-build
+	tar -xJf $< -C $(BUILD)
+	$(BUILDENV) cmake -G Ninja -S $(LLVM_SRC)/llvm -B $(BUILD)/llvm-build -Wno-dev \
+		-DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=$(CC) -DCMAKE_CXX_COMPILER=$(CXX) \
+		-DCMAKE_C_FLAGS="$(COMPILER_CFLAGS)" -DCMAKE_CXX_FLAGS="$(COMPILER_CFLAGS)" \
+		-DCMAKE_C_FLAGS_RELEASE=-DNDEBUG -DCMAKE_CXX_FLAGS_RELEASE=-DNDEBUG \
+		-DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=host \
+		-DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
+		-DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+		-DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_LIBPFM=OFF -DLLVM_ENABLE_CURL=OFF \
+		-DLLVM_ENABLE_FFI=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+		-DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+		-DLLVM_INCLUDE_DOCS=OFF -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF \
+		-DLLVM_PARALLEL_LINK_JOBS=1 >/dev/null
+	$(BUILDENV) ninja -C $(BUILD)/llvm-build -j $(COMPILER_JOBS) clang
+	cp $(BUILD)/llvm-build/bin/clang $@
+
+$(BUILD)/gcc-$(GCC_VERSION).tar.xz: | $(BUILD)
+	$(call fetch,$(GCC_URL),$(GCC_SHA256))
+
+$(BUILD)/gmp-$(GMP_VERSION).tar.bz2: | $(BUILD)
+	$(call fetch,$(GCC_INFRA_URL)/gmp-$(GMP_VERSION).tar.bz2,$(GMP_SHA256))
+
+$(BUILD)/mpfr-$(MPFR_VERSION).tar.bz2: | $(BUILD)
+	$(call fetch,$(GCC_INFRA_URL)/mpfr-$(MPFR_VERSION).tar.bz2,$(MPFR_SHA256))
+
+$(BUILD)/mpc-$(MPC_VERSION).tar.gz: | $(BUILD)
+	$(call fetch,$(GCC_INFRA_URL)/mpc-$(MPC_VERSION).tar.gz,$(MPC_SHA256))
+
+# Only cc1, the compiler proper: the gcc command is a driver that starts
+# cc1 as a program of its own, and record keeps only the program it is
+# given. C only, built once (no bootstrap: gcc otherwise builds itself
+# three times), with GMP, MPFR and MPC built in, so it takes none from
+# the system. all-gcc stops before the libraries gcc's programs are
+# linked with (libgcc and others), which cc1 does not need. Off: other
+# languages, translations, link-time optimization, plugins, ISL (loop
+# optimizations that -O2 does not use) and zstd. The prefix, as for git,
+# is a folder that does not exist. GMP's build needs m4 (apt install m4).
+$(BUILD)/cc1: $(BUILD)/gcc-$(GCC_VERSION).tar.xz $(BUILD)/gmp-$(GMP_VERSION).tar.bz2 \
+		$(BUILD)/mpfr-$(MPFR_VERSION).tar.bz2 $(BUILD)/mpc-$(MPC_VERSION).tar.gz Makefile
+	rm -rf $(GCC_SRC) $(BUILD)/gcc-build
+	tar -xJf $< -C $(BUILD)
+	tar -xjf $(BUILD)/gmp-$(GMP_VERSION).tar.bz2 -C $(GCC_SRC)
+	mv $(GCC_SRC)/gmp-$(GMP_VERSION) $(GCC_SRC)/gmp
+	tar -xjf $(BUILD)/mpfr-$(MPFR_VERSION).tar.bz2 -C $(GCC_SRC)
+	mv $(GCC_SRC)/mpfr-$(MPFR_VERSION) $(GCC_SRC)/mpfr
+	tar -xzf $(BUILD)/mpc-$(MPC_VERSION).tar.gz -C $(GCC_SRC)
+	mv $(GCC_SRC)/mpc-$(MPC_VERSION) $(GCC_SRC)/mpc
+	mkdir $(BUILD)/gcc-build
+	cd $(BUILD)/gcc-build && $(BUILDENV) $(abspath $(GCC_SRC))/configure --quiet \
+		CC="$(CC)" CXX="$(CXX)" CFLAGS="$(COMPILER_CFLAGS)" CXXFLAGS="$(COMPILER_CFLAGS)" \
+		--prefix=/nonexistent --enable-languages=c --disable-bootstrap --disable-multilib \
+		--disable-nls --disable-lto --disable-plugin --without-isl --without-zstd
+	$(BUILDENV) $(MAKE) -C $(BUILD)/gcc-build all-gcc
+	cp $(BUILD)/gcc-build/gcc/cc1 $@
+
 $(BUILD)/silesia.zip: | $(BUILD)
 	$(call fetch,$(SILESIA_URL),$(SILESIA_SHA256))
 
@@ -288,4 +397,4 @@ $(BUILD):
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all quicksort zstd xz sqlite git magick data clean
+.PHONY: all quicksort zstd xz sqlite git magick clang gcc data clean
