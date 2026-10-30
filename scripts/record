@@ -8,9 +8,9 @@
 #
 # Usage:
 #   record all -n <nick> -w <workload> [-r <runs>] [-u] [-c <cycles>] [-q]
-#              [-m <dir>] <program> [<arg>...]
+#              [-m <dir>] [-p <program>] <program> [<arg>...]
 #   record time -n <nick> -w <workload> [-u] [-c <cycles>] [-q] [-m <dir>]
-#               <program> [<arg>...]
+#               [-p <program>] <program> [<arg>...]
 #   record count -n <nick> -w <workload> [-q] [-m <dir>] <program>
 #                [<arg>...]
 #
@@ -38,6 +38,11 @@
 #                for a program that prints its result, like xz -c
 #   -m <dir>     the measurements folder (default: measurements/ in the
 #                repo)
+#   -p <program> measure <program>, which the command after the options
+#                starts, perhaps many times; e.g. make starting gcc's
+#                cc1 once for each file it compiles. Time runs only:
+#                callgrind does not follow the processes a command
+#                starts, so record all skips the count.
 #
 # all restores the system also on errors and Ctrl-C. It counts after
 # that, as the user who ran sudo: counts do not depend on tuning, and
@@ -55,6 +60,10 @@
 # Time runs by hand, from two terminals:
 #   sudo scripts/tune hold
 #   sudo scripts/record time -n t14 -w quicksort-100m ./build/quicksort 100000000
+#
+# A program that a command starts (here gcc's cc1, started by make);
+# the command must clean up first, or a second run has nothing to do:
+#   sudo scripts/record time -n t14 -w cc1-git -p build/cc1 sh -c 'make clean; make -j1'
 #
 # Layout under the measurements folder:
 #
@@ -95,11 +104,12 @@
 #
 # Time: one sample every <cycles> cycles (cycles:P: the most precise
 # sampling the CPU supports); a prime period avoids falling into step
-# with loops. Only the program's own process is kept. perf runs outside
-# tune.slice and only the program inside it, keeping perf's own work off
-# the measured CPU. That relies on systemd-run --scope moving itself
-# into the slice before exec'ing the program, so a sample on any other
-# CPU fails the run.
+# with loops. Only processes with the program's name are kept, and they
+# must all run the program's very file. perf runs outside tune.slice
+# and only the program inside it, keeping perf's own work off the
+# measured CPU. That relies on systemd-run --scope moving itself into
+# the slice before exec'ing the program, so a sample on any other CPU
+# fails the run.
 #
 # Count: instructions are named as perf names them (function and
 # offset), so the lists line up with the time runs'. Valgrind's own code
@@ -140,6 +150,10 @@ WORKLOAD=
 # set by -q: the program's output is thrown away
 DISCARD=
 ARGS=
+# set by -p: the command that starts the program, quoted
+STARTER=
+# a time run's folder in RAM for perf's samples
+PERF_RAM=
 
 # records an error in the run being written, if there is one
 record_error() {
@@ -267,16 +281,18 @@ check_workload() {
 }
 
 # check_command root: stops if the workload's earlier runs ran another
-# command (the program's file name, its arguments, and whether its
-# output was thrown away), so that runs of different settings or inputs
-# never mix under one name. An empty root means measurements/ in the
-# repo.
+# command (the program's file name, its arguments, what started it with
+# -p, and whether its output was thrown away), so that runs of different
+# settings or inputs never mix under one name. An empty root means
+# measurements/ in the repo.
 check_command() {
-	this="$BASE $ARGS${DISCARD:+ (output discarded, -q)}"
+	this="$BASE $ARGS${STARTER:+ (started by: $STARTER)}${DISCARD:+ (output discarded, -q)}"
 	for f in "${1:-$SCRIPTS/../measurements}/$WORKLOAD"/time/*.meta.txt \
 		"${1:-$SCRIPTS/../measurements}/$WORKLOAD"/count/*.meta.txt; do
 		[ -f "$f" ] || continue
 		that="$(sed -n 's/^program:       //p' "$f" | head -1) $(sed -n 's/^arguments:     //p' "$f" | head -1)"
+		starter=$(sed -n 's/^started by:    //p' "$f" | head -1)
+		that="$that${starter:+ (started by: $starter)}"
 		if grep -q '^== program.out (discarded, -q)$' "$f"; then
 			that="$that (output discarded, -q)"
 		fi
@@ -310,6 +326,27 @@ check_program() {
 	esac
 }
 
+# take_command measured command...: sets PROG and BASE, and ARGS, or
+# with a measured program (-p) STARTER, the whole command
+take_command() {
+	if [ -n "$1" ]; then
+		check_program "$1"
+		shift
+		# found the way the program's environment finds it (word
+		# splitting intended: ENVIRONMENT is a list of settings)
+		env -i $ENVIRONMENT sh -c 'command -v "$1"' sh "$1" >/dev/null ||
+			die "command not found (the program's PATH is /usr/bin:/bin): $1"
+		STARTER=
+		for a in "$@"; do
+			STARTER="$STARTER${STARTER:+ }$(quote "$a")"
+		done
+	else
+		check_program "$2"
+		shift 2
+		ARGS="$*"
+	fi
+}
+
 need_root() {
 	if [ "$(id -u)" != 0 ]; then
 		die_cmd "must run as root ($1)" "sudo ${CMDLINE:-$0}"
@@ -337,6 +374,12 @@ mkdir_own() {
 # Note why an unfinished run stopped, and hand its files to the user.
 on_exit() {
 	status=$?
+	if [ -n "$PERF_RAM" ]; then
+		if [ -f "$PERF_RAM/perf.data" ] && [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
+			mv "$PERF_RAM/perf.data" "$STAGE/perf.data" || true
+		fi
+		rm -rf "$PERF_RAM"
+	fi
 	if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
 		if [ "$status" != 0 ] && [ ! -e "$STAGE/error.txt" ]; then
 			echo "stopped with exit status $status (129: terminal closed, 130: Ctrl-C, 141: output pipe closed, 143: killed)" >"$STAGE/error.txt"
@@ -587,10 +630,15 @@ meta_common() {
 	echo "repo commit:   $(repo_commit)"
 	echo "platform:      $PLATFORM (see platforms/$PLATFORM.txt)"
 	# printf: echo would turn a \t in an argument into a tab
-	printf 'command:       %s %s\n' "$PROG" "$*"
-	# the two that make up the workload, the same on every machine
+	if [ -n "$STARTER" ]; then
+		printf 'command:       %s\n' "$STARTER"
+	else
+		printf 'command:       %s %s\n' "$PROG" "$*"
+	fi
+	# what makes up the workload, the same on every machine
 	printf 'program:       %s\n' "$BASE"
 	printf 'arguments:     %s\n' "$*"
+	[ -z "$STARTER" ] || printf 'started by:    %s\n' "$STARTER"
 	echo "binary:        sha256 $PROG_SHA, stored as binaries/$(basename "$BINARY")"
 	echo "compiler:      $(readelf -p .comment "$PROG" 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | head -1)"
 	# from the debug information of the program's first source file: the
@@ -667,9 +715,11 @@ record_all() {
 	PERIOD=
 	QUIET=
 	MDIR=
-	while getopts hn:w:r:uc:qm: opt; do
+	MEASURED=
+	while getopts hn:w:r:uc:qm:p: opt; do
 		case "$opt" in
 		h) usage 0 ;;
+		p) MEASURED=$OPTARG ;;
 		n) NICK=$OPTARG ;;
 		w) WORKLOAD=$OPTARG ;;
 		r) RUNS=$OPTARG ;;
@@ -689,8 +739,7 @@ record_all() {
 	esac
 	check_period "$PERIOD"
 	# checked here too, so that these fail before the system is tuned
-	check_program "$1"
-	ARGS=$(shift; printf '%s' "$*")
+	take_command "$MEASURED" "$@"
 	check_command "$MDIR"
 
 	need_root "tuning and perf need it"
@@ -735,13 +784,17 @@ record_all() {
 			tune_system
 		fi
 		"$SCRIPTS/record" time -n "$NICK" -w "$WORKLOAD" $UNTUNED \
-			${PERIOD:+-c} ${PERIOD:+"$PERIOD"} $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@" ||
+			${PERIOD:+-c} ${PERIOD:+"$PERIOD"} $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} \
+			${MEASURED:+-p} ${MEASURED:+"$MEASURED"} "$@" ||
 			failed=$((failed + 1))
 		i=$((i + 1))
 	done
 	untune
 
-	if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+	if [ -n "$MEASURED" ]; then
+		note "no count run: callgrind does not follow the processes a command starts, so a -p workload gets time runs only"
+		set -- true
+	elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
 		set -- sudo -u "$SUDO_USER" -- "$SCRIPTS/record" count -n "$NICK" -w "$WORKLOAD" $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
 	else
 		set -- "$SCRIPTS/record" count -n "$NICK" -w "$WORKLOAD" $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
@@ -759,11 +812,13 @@ record_time() {
 	MDIR=
 	UNTUNED=0
 	OUT=
-	while getopts hn:w:uc:qm: opt; do
+	MEASURED=
+	while getopts hn:w:uc:qm:p: opt; do
 		case "$opt" in
 		h) usage 0 ;;
 		n) NICK=$OPTARG ;;
 		w) WORKLOAD=$OPTARG ;;
+		p) MEASURED=$OPTARG ;;
 		u) UNTUNED=1 ;;
 		c) PERIOD=$OPTARG ;;
 		q) OUT=/dev/null; DISCARD=1 ;;
@@ -776,9 +831,8 @@ record_time() {
 	check_nick "$NICK"
 	check_workload "$WORKLOAD"
 	check_period "$PERIOD"
-	check_program "$1"
-	shift
-	ARGS="$*"
+	take_command "$MEASURED" "$@"
+	[ -n "$STARTER" ] || shift
 	# the kernel keeps only the first 15 characters as the process name
 	COMM=$(printf '%s' "$BASE" | cut -c1-15)
 
@@ -838,7 +892,7 @@ for an untuned baseline run."
 	# right before and after (for noise_report), so the noise covers the
 	# program, not perf starting up. The process-name filter below drops
 	# its samples.
-	set -- "$PROG" "$@"
+	[ -n "$STARTER" ] || set -- "$PROG" "$@"
 	# perf needs root; the program runs as the user who ran sudo, as it
 	# does in count runs: what a user may do can change what a program
 	# does
@@ -856,7 +910,11 @@ for an untuned baseline run."
 	else
 		note "recording $BASE as $RUN, untuned"
 	fi
-	perf record -e "$EVENT" -c "$PERIOD" --sample-cpu -o "$STAGE/perf.data" -- \
+	# perf writes its samples to RAM and they move to the run's folder
+	# afterwards: on a slow disk perf falls behind and drops samples (2 of
+	# 5 git clone runs on the Pi's USB disk did, 87 MB of samples each)
+	PERF_RAM=$(mktemp -d /dev/shm/record.XXXXXX) || die "could not create a folder in /dev/shm for perf's samples"
+	perf record -e "$EVENT" -c "$PERIOD" --sample-cpu -o "$PERF_RAM/perf.data" -- \
 		sh -c '
 			snapshot() {
 				cat /proc/interrupts >"$2.interrupts"
@@ -874,6 +932,9 @@ for an untuned baseline run."
 		sh "$BENCH" "$STAGE" "${OUT:-$STAGE/program.out}" "$@" \
 		2>"$STAGE/perf-record.log" ||
 		die "perf record failed: $(cat "$STAGE/perf-record.log")"
+	mv "$PERF_RAM/perf.data" "$STAGE/perf.data"
+	rmdir "$PERF_RAM"
+	PERF_RAM=
 	[ -s "$STAGE/status" ] || die "the program did not run to the end; see $STAGE/perf-record.log"
 	if [ "$UNTUNED" = 0 ]; then
 		[ -f /run/tune.state ] || die "the system was restored during the run, so it was not tuned throughout"
@@ -884,36 +945,78 @@ for an untuned baseline run."
 	rm "$STAGE/status"
 	[ "$status" = 0 ] || program_failed "$status" "the program (or what starts it: systemd-run, env, setpriv)"
 
-	perf script -i "$STAGE/perf.data" --comms "$COMM" -F cpu,time,period \
-		>"$STAGE/check.raw" 2>"$STAGE/perf-script.log" ||
-		die "perf script failed: $(cat "$STAGE/perf-script.log")"
-	# one line per sample: "[cpu] time: period"
-	awk -v bench="$BENCH" '
+	# One line per sample: "tid [cpu] seconds.nanoseconds: period ip
+	# (file)". The clock comes from the gaps between a thread's samples:
+	# perf counts cycles per thread, so a gap is <period> cycles of that
+	# thread running, plus any time it waited. The median gap leaves the
+	# waits out, and threads or processes running at once do not add up.
+	# Seconds and nanoseconds are kept apart: as one number they would
+	# lose precision. The gaps are counted per whole MHz, so a long run
+	# needs no more memory than a short one.
+	{
+		rc=0
+		perf script -i "$STAGE/perf.data" --comms "$COMM" --ns -F tid,cpu,time,period,ip,dso \
+			2>"$STAGE/perf-script.log" || rc=$?
+		echo "$rc" >"$STAGE/perf-script.status"
+	} | awk -v bench="$BENCH" -v prog="$PROG" -v base="$BASE" -v others="$STAGE/others" '
 		{
-			cpu = $1; gsub(/[^0-9]/, "", cpu); cpu += 0   # "[003]" -> 3
-			t = $2; sub(/:$/, "", t)
-			n++; cycles += $3
-			if (n == 1) first = t
-			last = t
+			cpu = $2; gsub(/[^0-9]/, "", cpu); cpu += 0   # "[003]" -> 3
+			t = $3; sub(/:$/, "", t); split(t, p, ".")
+			n++
 			if (cpu != bench) off++
-			persec[int(t)] += $3
+			f = $0; sub(/^[^(]*\(/, "", f); sub(/\)$/, "", f)
+			b = f; sub(/.*\//, "", b)
+			if (b == base && f != prog) other[f]++
+			if ($1 in sec) {
+				g = (p[1] - sec[$1]) * 1e9 + (p[2] - ns[$1])
+				if (g > 0) {
+					m = int($4 / g * 1e3 + 0.5)
+					if (!ngaps || m < minm) minm = m
+					if (!ngaps || m > maxm) maxm = m
+					all[m]++; ngaps++
+					persec[p[1], m]++; insec[p[1]]++
+				}
+			}
+			sec[$1] = p[1]; ns[$1] = p[2]
+		}
+		# the median of the gaps counted in h, n of them
+		function median(h, n,   c, m) {
+			c = 0
+			for (m = minm; m <= maxm; m++) {
+				if (m in h) c += h[m]
+				if (2 * c >= n) return m
+			}
 		}
 		END {
-			# clock per whole second; the first and last are partial
-			for (k in persec) {
-				if (k + 0 <= int(first) || k + 0 >= int(last)) continue
-				mhz = persec[k] / 1e6
-				if (!secs || mhz < lo) lo = mhz
-				if (!secs || mhz > hi) hi = mhz
+			mhz = ngaps ? median(all, ngaps) : "n/a"
+			# per second, for seconds with enough gaps to trust the median
+			for (s in insec) {
+				if (insec[s] < 50) continue
+				split("", h)
+				for (m = minm; m <= maxm; m++) if ((s, m) in persec) h[m] = persec[s, m]
+				m = median(h, insec[s])
+				if (!secs || m < lo) lo = m
+				if (!secs || m > hi) hi = m
 				secs++
 			}
-			printf "%d %d %.6f %.6f %.0f %d %.0f %.0f\n", n, off, first, last, cycles, secs, lo, hi
+			for (f in other) printf "    %s (%d samples)\n", f, other[f] >others
+			printf "%d %d %s %d %d %d\n", n + 0, off + 0, mhz, secs + 0, lo + 0, hi + 0
 		}
-	' "$STAGE/check.raw" >"$STAGE/check"
-	read -r nsamples offcpu first last cycles secs lo hi <"$STAGE/check"
-	rm "$STAGE/check.raw" "$STAGE/check"
+	' >"$STAGE/check"
+	[ "$(cat "$STAGE/perf-script.status")" = 0 ] ||
+		die "perf script failed: $(cat "$STAGE/perf-script.log")"
+	read -r nsamples offcpu mhz secs lo hi <"$STAGE/check"
+	rm "$STAGE/check" "$STAGE/perf-script.status"
 	[ "$nsamples" -gt 0 ] ||
 		die "no samples from a process named $COMM in $STAGE/perf.data"
+	# record keeps processes by name, and rank tells files apart by name
+	# only, so another file of the same name would mix in unnoticed
+	[ ! -s "$STAGE/others" ] ||
+		die "processes named $COMM ran other files than $PROG:
+$(cat "$STAGE/others")
+so their samples would be mixed with its own. Make the command start
+$PROG itself (for git: --exec-path; for gcc: -B)."
+	rm -f "$STAGE/others"
 	[ "$UNTUNED" = 1 ] || [ "$offcpu" = 0 ] ||
 		die "$offcpu of $nsamples samples ran on other CPUs than $BENCH, so the program was not confined to tune.slice"
 	# perf lists only the record types that occur, as "NAME events: count";
@@ -928,13 +1031,11 @@ for an untuned baseline run."
 	[ "$stat_samples" -gt 0 ] || die "could not read the sample count from perf report --stats"
 	[ "$throttled" = 0 ] && [ "$lost" = 0 ] ||
 		die "perf dropped samples ($throttled throttled, $lost lost), so the counts are incomplete; the kernel's limit is now $(cat /proc/sys/kernel/perf_event_max_sample_rate) samples/s"
-	mhz=$(awk -v c="$cycles" -v a="$first" -v b="$last" \
-		'BEGIN { if (b > a) printf "%.0f", c / (b - a) / 1e6; else print "n/a" }')
 	if [ "$secs" -gt 0 ]; then
-		clock="~$mhz MHz on average, $lo-$hi MHz per whole second ($secs s)"
+		clock="~$mhz MHz while it ran, $lo-$hi MHz per second ($secs s)"
 		clock_short="$lo-$hi MHz"
 	else
-		clock="~$mhz MHz on average (too short for per-second figures)"
+		clock="~$mhz MHz while it ran (too short for per-second figures)"
 		clock_short="~$mhz MHz"
 	fi
 

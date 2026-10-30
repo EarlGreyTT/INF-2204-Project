@@ -24,6 +24,10 @@
 #                                   of test photos used in image
 #                                   compression research (the download,
 #                                   346 MB, is of the whole set)
+#                    build/clones/  for the clone workloads: the history
+#                                   of one release each of git, Lua,
+#                                   SQLite, curl and Neovim, as bare
+#                                   repositories (460 MB)
 #   make clean       remove build/
 #
 # Third-party programs: a pinned release, its download checked against
@@ -151,6 +155,31 @@ SILESIA_URL = https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
 IMAGES_SHA256 = 16c273504425923259b1ddf8e39dfa9cb27585d249f6263cfc6bea39cfafa660
 IMAGES_URL = https://imagecompression.info/test_images/rgb8bit.zip
 
+# The repositories for the clone workloads: the history up to one
+# release (the commit its tag points to), packed by our git. The pack
+# file's SHA-256 is that of our first build (2026-10-30).
+CLONES = git lua sqlite curl neovim
+# v2.56.0
+CLONE_URL_git = https://github.com/git/git
+CLONE_COMMIT_git = a018953688f1b10bddf91bff8747068f5f4746a4
+CLONE_PACK_SHA256_git = 4fa8b52f40a4f834edbc78d3a5c5becd7b4ffd519aafe9f41e3c6f82aabe09a8
+# v5.5.1
+CLONE_URL_lua = https://github.com/lua/lua
+CLONE_COMMIT_lua = 7579fc9d7ed90240487251dfb69168f8e64e9294
+CLONE_PACK_SHA256_lua = 13e2ea3d21c4c47e1f5fb866b35344dd04240258b37ddfb450b8c494849f83b6
+# version-3.54.0
+CLONE_URL_sqlite = https://github.com/sqlite/sqlite
+CLONE_COMMIT_sqlite = 6932c59ee5c280599dfae9e7b431698a7cab9687
+CLONE_PACK_SHA256_sqlite = d622152796d838f55a94355c0e0b7ce97c337f061cf23ec575f34a9bd129bcbf
+# curl-8_23_0
+CLONE_URL_curl = https://github.com/curl/curl
+CLONE_COMMIT_curl = 3163ec065643ba20709f190111f42c3e1fe95273
+CLONE_PACK_SHA256_curl = c4bdda77ff2ab53c1f49ec693df101deb6de03076e8a0ff2cd6af6016be7eac9
+# v0.12.6
+CLONE_URL_neovim = https://github.com/neovim/neovim
+CLONE_COMMIT_neovim = 779c36969e31080503be2dfccbcc3f999e289606
+CLONE_PACK_SHA256_neovim = 225b33bbd1c11b777352ac9b4f813b4b51c79dd08fbbc4eacfaabbfeda18e8dd
+
 all: quicksort zstd xz sqlite git magick
 
 quicksort: $(BUILD)/quicksort
@@ -161,7 +190,7 @@ git: $(BUILD)/git
 magick: $(BUILD)/magick
 clang: $(BUILD)/clang
 gcc: $(BUILD)/cc1
-data: $(BUILD)/silesia $(BUILD)/repo $(BUILD)/bridge.ppm
+data: $(BUILD)/silesia $(BUILD)/repo $(BUILD)/bridge.ppm $(foreach c,$(CLONES),$(BUILD)/clones/$(c).git)
 
 # fetch url sha256: downloads to $@, kept only if the checksum matches
 define fetch
@@ -389,6 +418,38 @@ $(BUILD)/rgb8bit.zip: | $(BUILD)
 # one photo of a common size: 2749 x 4049 pixels (11 megapixels)
 $(BUILD)/bridge.ppm: $(BUILD)/rgb8bit.zip
 	unzip -p $< bridge.ppm > $@.part
+	mv $@.part $@
+
+# Both gits run without the settings of the user or the system
+# (~/.gitconfig, /etc/gitconfig, GIT_* variables): some change the pack
+# or the repository's format. The system's git downloads (ours has no
+# network support), told to leave out what it would add by itself
+# (commit graphs, maintenance), as that differs between versions. Our
+# git then packs everything anew, the way a server keeps its
+# repositories (with a bitmap index), with fixed settings and one
+# thread. -F also compresses every object again, with our zlib:
+# otherwise objects keep the bytes the server sent, which can differ
+# from one download to the next. build/ comes first in PATH, so that the
+# helpers git starts (pack-objects) are ours too, not the system's (our
+# git has no folder of its own for them). So every platform gets the
+# same pack file: how objects are packed changes the work a clone does.
+# Two checks: the release's commit, and the pack file's SHA-256. Our git
+# is only needed to be there (|): a rebuilt git need not download the
+# repositories again; if it packed differently, the check would say so.
+CLONE_FETCH = env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C TZ=UTC GIT_CONFIG_NOSYSTEM=1 git
+CLONE_GIT = env -i PATH=$(abspath $(BUILD)):/usr/bin:/bin HOME=/nonexistent LC_ALL=C TZ=UTC \
+	GIT_CONFIG_NOSYSTEM=1 $(abspath $(BUILD))/git
+$(BUILD)/clones/%.git: | $(BUILD)/git
+	rm -rf $@.part $@
+	mkdir -p $(BUILD)/clones
+	$(CLONE_GIT) init -q --bare --template= -b main $@.part
+	$(CLONE_FETCH) -C $@.part -c gc.auto=0 -c maintenance.auto=false -c fetch.writeCommitGraph=false \
+		fetch -q --no-tags --no-write-fetch-head $(CLONE_URL_$*) $(CLONE_COMMIT_$*):refs/heads/main
+	rm -rf $@.part/objects/info/commit-graph $@.part/objects/info/commit-graphs
+	$(CLONE_GIT) -C $@.part -c pack.threads=1 -c pack.window=10 -c pack.depth=50 \
+		-c repack.writeBitmaps=true repack -q -a -d -F
+	test "$$($(CLONE_GIT) -C $@.part rev-parse main)" = $(CLONE_COMMIT_$*)
+	echo "$(CLONE_PACK_SHA256_$*)  $$(echo $@.part/objects/pack/*.pack)" | sha256sum -c --quiet
 	mv $@.part $@
 
 $(BUILD):

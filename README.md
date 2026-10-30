@@ -32,11 +32,23 @@ In this folder, with a laptop on its charger:
 sudo scripts/measure -n "$nick" all
 ```
 
-This builds the programs, downloads their inputs (440 MB) and measures
+This builds the programs, downloads their inputs (900 MB) and measures
 each workload in `workloads.txt`. Wi-Fi and Bluetooth are off during
 the time runs: over ssh on Wi-Fi, run it inside `screen`. If it stops
 early, it prints a command that runs the workloads it did not finish.
 Results go to `measurements/<workload>/`.
+
+## After a git pull
+
+`make` rebuilds a program whenever the Makefile has changed. For
+`build/cc1` and `build/clang` that takes hours on a Raspberry Pi. If
+the change did not touch how they are built (it says so in its
+description), mark them as up to date instead (`-c`: only those you
+have built):
+
+```sh
+touch -c build/cc1 build/clang build/git
+```
 
 ## Cleaner measurements
 

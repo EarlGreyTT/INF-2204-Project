@@ -11,10 +11,10 @@
 #   measure -n <nick> [-r <runs>] [-u] [-c <cycles>] [-m <dir>]
 #           <workload>...
 #
-#   all          build the programs, download their inputs (440 MB the
-#                first time), then run record all (time runs, then a
-#                count) on every workload in workloads.txt, in order; as
-#                root
+#   all          build the programs, download their inputs (about
+#                900 MB the first time), then run record all (time runs,
+#                then a count) on every workload in workloads.txt, in
+#                order; as root. Workloads with -p get time runs only.
 #   <workload>   the same for only these workloads
 #
 #   -n <nick>    your machine's short name, e.g. t14; the same every time
@@ -26,6 +26,10 @@
 # that runs just those. Such a rerun records a workload again in full:
 # its good runs from before stay, so it can end up with more runs than
 # the others.
+#
+# Workloads may keep files in /tmp/inf2204.<user id> (RAM on most
+# machines; the clone workloads do); measure empties it before and
+# after each workload.
 
 set -eu
 # no globbing: workloads.txt's lines are split into words, and a word
@@ -125,6 +129,8 @@ done
 NICK=
 RUNS=
 UNTUNED=
+# set before the workloads run; emptied on exit
+SCRATCH=
 PERIOD=
 MDIR=
 while getopts n:r:uc:m: opt; do
@@ -219,6 +225,7 @@ left=$todo
 # that runs just those.
 on_exit() {
 	status=$?
+	[ -z "${SCRATCH:-}" ] || rm -rf "$SCRATCH"
 	again="$failed${failed:+${left:+ }}$left"
 	[ -n "$again" ] || return 0
 	if [ -n "$left" ]; then
@@ -241,6 +248,7 @@ trap 'exit 141' PIPE
 trap 'exit 143' TERM
 
 cd "$REPO"
+SCRATCH=/tmp/inf2204.${SUDO_UID:-$(id -u)}
 total=$(echo "$todo" | wc -w)
 i=0
 while [ -n "$left" ]; do
@@ -249,9 +257,11 @@ while [ -n "$left" ]; do
 	note "workload $i of $total: $w"
 	# word splitting intended: the line is a list of words
 	set -- $(workload_line "$w")
+	rm -rf "$SCRATCH"
 	status=0
 	"$SCRIPTS/record" all -n "$NICK" -w "$w" ${RUNS:+-r} ${RUNS:+"$RUNS"} $UNTUNED \
 		${PERIOD:+-c} ${PERIOD:+"$PERIOD"} ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@" || status=$?
+	rm -rf "$SCRATCH"
 	case "$status" in
 	0) left=$(rest "$left") ;;
 	# terminal closed, Ctrl-C, pipe closed, killed: stop the series
