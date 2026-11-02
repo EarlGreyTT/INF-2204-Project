@@ -94,8 +94,12 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+from array import array
 from collections import Counter
+
+import numpy as np
 
 
 def die(msg):
@@ -647,7 +651,7 @@ def count_rep_jumps(counts, arcs):
     instruction itself."""
     fixed, before, after = 0, 0, 0
     for (ob, a, target), n in list(arcs.items()):
-        if a == target and ob and REP.match(instructions(ob)[0].get(a, "")):
+        if a == target and ob and a in code(ob).rep:
             fixed, before, after = fixed + 1, before + counts[(ob, a)], after + counts[(ob, a)] - n
             counts[(ob, a)] -= n
             del arcs[(ob, a, target)]
@@ -685,12 +689,96 @@ def count_rep_once(counts):
               f"{before:,} Ir -> {after:,}", file=sys.stderr)
 
 
+INSTRUCTION = re.compile(r"\s+([0-9a-f]+):\s+(.*)")
+
+
+class Code:
+    """What the counts need of an object's instructions, kept small: a
+    compiler has millions of them, and their text in a dict took
+    gigabytes (2 GB for our cc1), several times over when counts run
+    side by side. The addresses in order, which ones have no instruction
+    right before them (after a label), the rep string instructions and
+    the targets of unconditional jumps to a fixed address. By objdump,
+    read as it comes."""
+
+    def __init__(self, path):
+        addrs, after_label = array("Q"), bytearray()
+        jump_from, jump_to = array("Q"), array("Q")
+        self.rep = set()
+        last = None
+        dump = subprocess.Popen(["objdump", "-d", "--no-show-raw-insn", "-w", path],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env=ENV)
+        for l in dump.stdout:
+            m = INSTRUCTION.match(l)
+            if not m:
+                last = None  # a new function or section
+                continue
+            a = int(m[1], 16)
+            addrs.append(a)
+            after_label.append(last is None)
+            last = a
+            if REP.match(m[2]):
+                self.rep.add(a)
+            elif j := DIRECT_JUMP.match(m[2]):
+                jump_from.append(a)
+                jump_to.append(int(j[1], 16))
+        err = dump.stderr.read()
+        if dump.wait():
+            die(f"objdump -d failed: {err.strip()}")
+        order = np.argsort(np.frombuffer(addrs, dtype=np.uint64), kind="stable")
+        self.addrs = np.frombuffer(addrs, dtype=np.uint64)[order]
+        self.after_label = np.frombuffer(after_label, dtype=np.bool_)[order]
+        # the instruction before each, in the file's order (objdump's)
+        before = np.concatenate(([0], np.frombuffer(addrs, dtype=np.uint64)[:-1]))
+        self.before = before[order]
+        jorder = np.argsort(np.frombuffer(jump_from, dtype=np.uint64), kind="stable")
+        self.jump_from = np.frombuffer(jump_from, dtype=np.uint64)[jorder]
+        self.jump_to = np.frombuffer(jump_to, dtype=np.uint64)[jorder]
+
+    @staticmethod
+    def _find(keys, wanted):
+        """For each wanted address, its index in keys, or -1."""
+        wanted = np.fromiter(wanted, dtype=np.uint64)
+        i = np.searchsorted(keys, wanted)
+        i[i >= len(keys)] = 0
+        hit = (keys[i] == wanted) if len(keys) else np.zeros(len(wanted), bool)
+        return wanted, np.where(hit, i, -1)
+
+    def prev_of(self, wanted):
+        """{address: the instruction right before it, or None after a
+        label} for the wanted addresses; None for one not in the code."""
+        wanted, i = self._find(self.addrs, wanted)
+        out = {}
+        for a, k in zip(wanted.tolist(), i.tolist()):
+            out[a] = None if k < 0 or self.after_label[k] else int(self.before[k])
+        return out
+
+    def jumps_of(self, wanted):
+        """{address: target} for the wanted addresses that are
+        unconditional jumps to a fixed address."""
+        wanted, i = self._find(self.jump_from, wanted)
+        keep = i >= 0
+        return dict(zip(wanted[keep].tolist(), self.jump_to[i[keep]].tolist()))
+
+
+_code = {}
+
+
+def code(path):
+    if path not in _code:
+        _code[path] = Code(path)
+    return _code[path]
+
+
 _instructions = {}
 
 
 def instructions(path):
     """({address: instruction} in address order, {address: the
-    instruction right before it, or None after a label}), by objdump."""
+    instruction right before it, or None after a label}), by objdump.
+    The whole text: for count_rep_once (counts recorded without jumps)
+    only; everything else uses code()."""
     if path not in _instructions:
         text, prev, last = {}, {}, None
         for l in run("objdump", "-d", "--no-show-raw-insn", "-w", path).splitlines():
@@ -761,7 +849,7 @@ def rank_count_source(data, level):
             # gives the instruction at a start address to that copy
             first, starts, itself = {}, {}, set()
             if any(copy for _, copy in groups):
-                where, itself = entry_points(ob)
+                where, itself = entry_points(ob, exe)
                 for f, at in where.items():
                     starts[f] = {block[a] for a in at if a in block}
                     for a in at:
@@ -791,7 +879,7 @@ def rank_count_source(data, level):
                     n for (a, t), n in split_calls.items()
                     if block.get(t) in blocks and symbol_at(table, t)[2].startswith(key[0] + ".part.")
                     and any(f[0] == key[0] for f, _ in places[a][1])
-                    and not (block[a] in blocks and DIRECT_JUMP.match(instructions(ob)[0].get(a, ""))))
+                    and not (block[a] in blocks and code(ob).jumps_of([a])))
             else:
                 loc[key] += entries(blocks, ran, pred)
             if level == "lines":
@@ -817,7 +905,7 @@ def flow(ob, exe, jumps, starts):
     What reached an instruction and was no jump came from the
     instruction right before it, unless it starts a function: then it
     was a call. A block ends where control can go elsewhere."""
-    text, prev = instructions(ob)
+    prev, direct = code(ob).prev_of(exe), code(ob).jumps_of(exe)
     out = Counter()
     for (a, _), n in jumps.items():
         out[a] += n
@@ -826,9 +914,9 @@ def flow(ob, exe, jumps, starts):
     # writes a jump to another function (a tail call, f.cold back to f)
     # as a call. Such a jump goes to its one target every time it runs.
     for a, n in exe.items():
-        if m := DIRECT_JUMP.match(text.get(a, "")):
+        if (t := direct.get(a)) is not None:
             if n > out[a]:
-                jumps[(a, int(m[1], 16))] += n - out[a]
+                jumps[(a, t)] += n - out[a]
     into, out = Counter(), Counter()
     for (a, t), n in list(jumps.items()):
         if a not in exe:
@@ -935,10 +1023,45 @@ def source_places(path, addresses):
     was inlined at: the calls it is inlined through. Without debug
     information: no line, and the symbol as the function."""
     addresses = sorted(addresses)
-    out = run("addr2line", "-a", "-f", "-i", "-e", path,
-              input="".join(f"{a:#x}\n" for a in addresses))
+    # Read as it comes, and each name, file and chain of calls kept once:
+    # for clang's two million addresses, addr2line's output in one string
+    # and a new string per frame took gigabytes.
+    shared = {}
+
+    def one(x):
+        return shared.setdefault(x, x)
+
+    with tempfile.TemporaryFile("w+") as inp:
+        inp.writelines(f"{a:#x}\n" for a in addresses)
+        inp.seek(0)
+        # stderr to a file, so that a long one cannot block addr2line
+        with tempfile.TemporaryFile("w+") as err:
+            dump = subprocess.Popen(["addr2line", "-a", "-f", "-i", "-e", path], stdin=inp,
+                                    stdout=subprocess.PIPE, stderr=err, text=True, env=ENV)
+            frames = read_frames(dump.stdout, path, one)
+            if dump.wait():
+                err.seek(0)
+                die(f"addr2line failed: {err.read().strip()}")
+    if set(frames) != set(addresses):
+        die(f"addr2line gave {len(frames)} of {len(addresses)} addresses in {path}")
+    table, places = symbols(path), {}
+    for a in addresses:
+        if f := frames[a]:
+            # a frame's own place is in it; the next frame's is the call
+            places[a] = (one(f[0][1:3]) if f[0][2] else None,
+                         [(one((name, src)), one(tuple(f[i + 1:])))
+                          for i, (name, src, _) in enumerate(f)])
+        else:
+            sym = symbol_at(table, a)
+            places[a] = (None, [(one((sym[2], "")), ())] if sym else [])
+    return places
+
+
+def read_frames(out, path, one):
+    """{address: [(function, source, line), ...] innermost first} from
+    addr2line -a -f -i's lines, each value kept once by one()."""
     frames, a, func = {}, None, None
-    for l in out.splitlines():
+    for l in (l.rstrip("\n") for l in out):
         if re.fullmatch(r"0x[0-9a-f]+", l) and func is None:
             a = int(l, 16)
             frames[a] = []
@@ -951,26 +1074,17 @@ def source_places(path, addresses):
             if not m:
                 die(f"addr2line: could not parse {l!r} for {a:#x} in {path}")
             if m[1] != "??" and func != "??":
-                frames[a].append((func, source_name(m[1]), int(m[2]) if m[2] != "?" else 0))
+                frames[a].append(one((one(func), one(source_name(m[1])),
+                                      int(m[2]) if m[2] != "?" else 0)))
             func = None
-    if set(frames) != set(addresses):
-        die(f"addr2line gave {len(frames)} of {len(addresses)} addresses in {path}")
-    table, places = symbols(path), {}
-    for a in addresses:
-        if f := frames[a]:
-            # a frame's own place is in it; the next frame's is the call
-            places[a] = (f[0][1:3] if f[0][2] else None,
-                         [((name, src), tuple(f[i + 1:])) for i, (name, src, _) in enumerate(f)])
-        else:
-            sym = symbol_at(table, a)
-            places[a] = (None, [((sym[2], ""), ())] if sym else [])
-    return places
+    return frames
 
 
-def entry_points(path):
+def entry_points(path, ran):
     """({function: {address}}, {(function, line)}), by the debug
     information: where the inlined copies of each function start
-    (DW_AT_entry_pc, else DW_AT_low_pc), and the copies of a function
+    (DW_AT_entry_pc, else DW_AT_low_pc), of the starts only those among
+    the addresses that ran (the only ones asked for), and the copies of a function
     inlined into itself at its own first line, which are the function
     itself (how GCC describes a function it split, like glibc's
     __random)."""
@@ -978,63 +1092,148 @@ def entry_points(path):
         path = debug_file(path)
         if not path:
             return {}, set()
-    dies, parents = {}, {}  # offset -> {attribute: value}; depth -> function or copy
-    node = None
+    # Only functions and their inlined copies are kept: what follow()
+    # reaches from a copy (its abstract origin, a declaration it
+    # specifies) is a function too. clang has 9.5 million of them, so
+    # they are kept as columns of numbers, not objects (3.4 GB as
+    # objects), each name once. NONE: no such attribute.
+    NONE = -1
+    node, inlined, parent, entry_pc, low_pc = (array("q"), bytearray(), array("q"),
+                                               array("q"), array("q"))
+    call_line, decl_line, origin = array("q"), array("q"), array("q")
+    name_of, name_id = array("q"), array("q")  # (entry, name) pairs, in entry order
+    names, ids = [], {}
+    cols = {"entry_pc": entry_pc, "low_pc": low_pc, "call_line": call_line,
+            "decl_line": decl_line}
+    parents = {}  # depth -> offset of the function or copy there
+    i = -1        # the entry attributes are read for, or -1
     # read as it comes: hundreds of MB for libc
     dump = subprocess.Popen(["objdump", "--dwarf=info", path], stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, text=True, env=ENV)
     for l in dump.stdout:
-        if "DW_TAG_" in l:
+        # only an entry's own line: a name can have DW_TAG_ in it too
+        # (gcc has a function get_DW_TAG_name)
+        if "DW_TAG_" in l and ": Abbrev Number: " in l:
             # " <2><4d9>: Abbrev Number: 55 (DW_TAG_inlined_subroutine)"
             depth = int(l[l.index("<") + 1:l.index(">")])
-            node = int(l[l.index("><") + 2:l.index(">:")], 16)
-            dies[node] = d = {"names": []}
-            if "DW_TAG_inlined_subroutine" in l:
-                d["parent"] = next((parents[k] for k in range(depth - 1, -1, -1)
-                                    if k in parents), None)
+            off = int(l[l.index("><") + 2:l.index(">:")], 16)
             if "DW_TAG_inlined_subroutine" in l or "DW_TAG_subprogram" in l:
-                parents[depth] = node
+                copy = "DW_TAG_inlined_subroutine" in l
+                p = NONE
+                if copy:
+                    p = next((parents[k] for k in range(depth - 1, -1, -1) if k in parents), NONE)
+                node.append(off)
+                inlined.append(copy)
+                parent.append(p)
+                for c in (entry_pc, low_pc, call_line, decl_line, origin):
+                    c.append(NONE)
+                i = len(node) - 1
+                parents[depth] = off
                 for k in [k for k in parents if k > depth]:
                     del parents[k]
             else:
                 parents.pop(depth, None)
-        elif node is None or "DW_AT_" not in l:
+                i = -1
+        elif i < 0 or "DW_AT_" not in l:
             continue
         elif "DW_AT_name " in l or "DW_AT_linkage_name" in l:
             # "DW_AT_name : (indirect string, offset: 0x2b5): ZSTD_count";
             # addr2line gives the linkage name where there is one
             v = l.split(": ", 1)[1].strip()
-            dies[node]["names"].append(v.split("): ", 1)[1] if v.startswith("(") else v)
+            v = v.split("): ", 1)[1] if v.startswith("(") else v
+            if v not in ids:
+                ids[v] = len(names)
+                names.append(v)
+            name_of.append(i)
+            name_id.append(ids[v])
         elif "DW_AT_abstract_origin" in l or "DW_AT_specification" in l:
             # "<0x750>"; not "<alt 0x...>" (a dwz file) or a signature
             if m := re.search(r"<0x([0-9a-f]+)>", l):
-                dies[node]["origin"] = int(m[1], 16)
+                origin[i] = int(m[1], 16)
         else:
             for at in ("entry_pc", "low_pc", "call_line", "decl_line"):
                 if f"DW_AT_{at} " in l:
-                    dies[node][at] = int(l.split()[-1], 0)
+                    cols[at][i] = int(l.split()[-1], 0)
     if dump.wait():
         die(f"objdump --dwarf=info {path} failed")
+    del ids
+    if not node:
+        return {}, set()
 
-    def follow(d, key):
-        """An attribute of a DIE or of what it comes from."""
+    def col(a):
+        return np.frombuffer(a, dtype=np.int64) if len(a) else np.zeros(0, np.int64)
+
+    node_, parent_, origin_ = col(node), col(parent), col(origin)
+    decl_ = col(decl_line)
+    name_of_, name_id_ = col(name_of), col(name_id)
+    inlined_ = np.frombuffer(inlined, dtype=np.bool_)
+    order = np.argsort(node_, kind="stable")
+    sorted_nodes = node_[order]
+
+    def index(offsets):
+        """The entry at each offset, or -1 (none, or not a function)."""
+        k = np.searchsorted(sorted_nodes, offsets)
+        k[k >= len(sorted_nodes)] = 0
+        hit = (offsets >= 0) & (sorted_nodes[k] == offsets)
+        return np.where(hit, order[k], -1)
+
+    # where each entry's names are: name_of is in entry order
+    first = np.searchsorted(name_of_, np.arange(len(node_)), side="left")
+    last = np.searchsorted(name_of_, np.arange(len(node_)), side="right")
+    has_names = last > first
+    has_decl = decl_ > 0  # as before: a line 0 is no line
+    origin_at = index(origin_)
+
+    def follow(start, has):
+        """For each start entry (or -1), the first entry along it and
+        its origins (at most 10) with the attribute, or -1."""
+        cur, out = start.copy(), np.full(len(start), -1)
         for _ in range(10):
-            if key in dies.get(d, ()) and dies[d][key]:
-                return dies[d][key]
-            d = dies.get(d, {}).get("origin")
+            live = (cur >= 0) & (out < 0)
+            if not live.any():
+                break
+            found = live.copy()
+            found[live] = has[cur[live]]
+            out[found] = cur[found]
+            move = live & ~found
+            cur[move] = origin_at[cur[move]]
+            cur[live & found] = -1
+        return out
+
+    copies = np.flatnonzero(inlined_)
+    named = follow(copies, has_names)
+    declared = follow(copies, has_decl)
+    # Only copies that start where code ran, or that may be the function
+    # itself (their line is the function's first), matter.
+    epc, lpc = col(entry_pc)[copies], col(low_pc)[copies]
+    at = np.where(epc != NONE, epc, lpc)
+    ran = np.fromiter(ran, dtype=np.int64)
+    started = (at != NONE) & np.isin(at, ran)
+    cl_ = col(call_line)[copies]
+    dl_ = np.where(declared >= 0, decl_[np.maximum(declared, 0)], NONE)
+    same = cl_ == dl_
+    keep = started | same
+    copies, named, declared = copies[keep], named[keep], declared[keep]
+    started, same = started[keep], same[keep]
+    parent_named = follow(index(parent_[copies]), has_names)
+
+    def names_at(e):
+        return [names[k] for k in name_id_[first[e]:last[e]].tolist()] if e >= 0 else []
 
     starts, itself = {}, set()
-    for d, info in dies.items():
-        if "parent" not in info:
-            continue
-        a = info.get("entry_pc", info.get("low_pc"))
-        names = follow(d, "names") or []
-        for name in names:
-            if a is not None:
+    for c, e, pe, st, sm in zip(copies.tolist(), named.tolist(), parent_named.tolist(),
+                                started.tolist(), same.tolist()):
+        a = entry_pc[c] if entry_pc[c] != NONE else low_pc[c]
+        cl = None if call_line[c] == NONE else call_line[c]
+        pnames = None
+        for name in names_at(e):
+            if st:
                 starts.setdefault(name, set()).add(a)
-            if (info.get("call_line") == follow(d, "decl_line")
-                    and name in (follow(info["parent"], "names") or [])):
-                itself.add((name, info["call_line"]))
+            if sm:
+                if pnames is None:
+                    pnames = names_at(pe)
+                if name in pnames:
+                    itself.add((name, cl))
     return starts, itself
 
 
@@ -1157,11 +1356,65 @@ def count_data(files):
     return read_sum(files[0])[0] if len(files) == 1 else count_addresses(*files)
 
 
+class Sum:
+    """Counts by key, summed over many processes: a key is an object
+    (None for none) and one or two addresses. Kept as numpy arrays: a
+    Counter of tuples took about 200 bytes an entry, and a compiler's
+    sum has millions of entries, so collect grew by gigabytes over a
+    build. Each process's counts wait as arrays and are folded into the
+    sum once they are as many as it."""
+
+    def __init__(self, width):
+        self.width = width  # addresses in a key
+        self.obs = {}       # object -> id
+        self.keys = np.zeros((0, 1 + width), np.uint64)
+        self.vals = np.zeros(0, np.int64)
+        self.pending, self.waiting = [], 0
+
+    def add(self, counter):
+        if not counter:
+            return
+        obid = self.obs.setdefault
+        k = np.array([(obid(key[0], len(self.obs)), *key[1:]) for key in counter],
+                     dtype=np.uint64).reshape(-1, 1 + self.width)
+        v = np.fromiter(counter.values(), dtype=np.int64, count=len(counter))
+        self.pending.append((k, v))
+        self.waiting += len(v)
+        if self.waiting >= max(len(self.vals), 1 << 20):
+            self.fold()
+
+    def fold(self):
+        if not self.pending:
+            return
+        k = np.concatenate([self.keys] + [p[0] for p in self.pending])
+        v = np.concatenate([self.vals] + [p[1] for p in self.pending])
+        self.pending, self.waiting = [], 0
+        order = np.lexsort(k.T[::-1])  # by object, then address(es)
+        k, v = k[order], v[order]
+        new = np.ones(len(v), dtype=bool)
+        new[1:] = (k[1:] != k[:-1]).any(axis=1)
+        starts = np.flatnonzero(new)
+        self.keys = k[starts]
+        self.vals = np.add.reduceat(v, starts) if len(v) else v
+
+    def objects(self):
+        return set(self.obs)
+
+    def items(self):
+        """((object, address...), count), a slice at a time."""
+        self.fold()
+        name = {i: ob for ob, i in self.obs.items()}
+        for s in range(0, len(self.vals), 1 << 16):
+            for key, n in zip(self.keys[s:s + (1 << 16)].tolist(),
+                              self.vals[s:s + (1 << 16)].tolist()):
+                yield (name[key[0]], *key[1:]), n
+
+
 def write_sum(path, program, processes, data):
-    """Writes the sum, gzipped text, through a temporary file."""
+    """Writes the sum (Sums from collect), gzipped text, through a
+    temporary file."""
     counts, arcs, inside, total, skipped = data
-    obs = sorted({k[0] for k in counts} | {k[0] for k in arcs} | {k[0] for k in inside},
-                 key=lambda o: o or "")
+    obs = sorted(counts.objects() | arcs.objects() | inside.objects(), key=lambda o: o or "")
     ids = {ob: str(i) if ob else "-" for i, ob in enumerate(obs)}
     with gzip.open(path + ".part", "wt") as f:
         f.write(f"{SUM_HEADER}\nprogram {program}\nprocesses {processes}\n"
@@ -1251,8 +1504,8 @@ def collect(folder, program):
     Returns (data, processes)."""
     prog = os.path.realpath(program)
     base = os.path.basename(prog)
-    counts, arcs, inside = Counter(), Counter(), Counter()
-    total = skipped = summed = 0
+    counts, arcs, inside = Sum(1), Sum(2), Sum(2)
+    total = skipped = summed = spawns = 0
     others, notes = Counter(), {}
     # pid -> (parent's pid, lines on loaded files), also of processes
     # whose files are gone, for the children a fork made
@@ -1289,10 +1542,18 @@ def collect(folder, program):
                 if not last:
                     continue
                 # A process that became a program valgrind does not
-                # follow (exec) leaves a log and no counts.
-                if os.path.exists(out) or (exe and os.path.realpath(exe) == prog):
+                # follow (exec) leaves a log and no counts. So does the
+                # program's own fork child that does so at once: clang
+                # starts the linker by posix_spawn, a copy of itself
+                # (vfork, which valgrind makes a fork) that runs ld. Such
+                # a child has no loaded files of its own in its log; the
+                # few instructions it ran first are not counted.
+                spawned = exe and os.path.realpath(exe) == prog and not own and bool(ppid)
+                if os.path.exists(out) or (exe and os.path.realpath(exe) == prog and not spawned):
                     die(f"process {pid} ({exe}) did not end normally: no complete counts "
                         f"in {out}")
+                if spawned:
+                    spawns += 1
                 os.remove(log)
                 continue
             if not exe:
@@ -1320,9 +1581,10 @@ def collect(folder, program):
                         os.remove(read)
                 if a is None:
                     die(f"{out}: no jumps recorded; run callgrind with --collect-jumps=yes")
-                counts.update(c)
-                arcs.update(a)
-                inside.update(i)
+                counts.add(c)
+                arcs.add(a)
+                inside.add(i)
+                del c, a, i
                 total, skipped, summed = total + t, skipped + sk, summed + 1
                 # each kind of message once, with how many processes had it
                 for l in err.getvalue().splitlines():
@@ -1343,6 +1605,9 @@ def collect(folder, program):
         die(f"no process ran {prog}")
     for l, n in notes.values():
         print(l if n == 1 else f"{l} (the first of {n} processes like it)", file=sys.stderr)
+    if spawns:
+        print(f"processes of {base} that became another program right after a fork "
+              f"(posix_spawn), not counted: {spawns}", file=sys.stderr)
     n = sum(others.values())
     print(f"processes: {summed} of {base}, summed; {n} other{'' if n == 1 else 's'} left out"
           + "".join(f", {n} {name}" for name, n in sorted(others.items())), file=sys.stderr)

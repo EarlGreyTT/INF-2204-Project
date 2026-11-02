@@ -11,17 +11,18 @@
 # record keeps each name to one command, so a changed command needs a
 # new name.
 #
-# The compile workloads sample every 1,000,003 cycles, not every
-# 100,003: a gcc build of git runs for minutes, and the default would
-# write about 200 MB of samples per run.
+# The compile workloads and SQLite's speedtest sample every 1,000,003
+# cycles, not every 100,003: a gcc build of git, or the speedtest at
+# size 1000, runs for minutes, and the default would write 100-200 MB of
+# samples per run.
 
 # name               options                       command
-quicksort-10m                                      build/quicksort 10000000
-zstd-3-silesia       -q                            build/zstd -3 -c build/silesia
-xz-1-silesia         -q                            build/xz -1 -c build/silesia
-sqlite-speedtest-100                               build/speedtest1 --testset main --singlethread --size 100 :memory:
+sqlite-speedtest-1000 -c 1000003                   build/speedtest1 --testset main --singlethread --size 1000 :memory:
 git-log-p            -q                            build/git -C build/repo log -p
 imagemagick-resize   -q                            build/magick build/bridge.ppm -resize 50% -unsharp 0x1 ppm:-
+imagemagick-resize-deer -q                         build/magick build/deer.ppm -resize 50% -unsharp 0x1 ppm:-
+imagemagick-resize-big-tree -q                     build/magick build/big_tree.ppm -resize 50% -unsharp 0x1 ppm:-
+imagemagick-resize-artificial -q                   build/magick build/artificial.ppm -resize 50% -unsharp 0x1 ppm:-
 zstd-19-git          -q                            build/zstd -19 -c build/tars/git.tar
 zstd-19-lua          -q                            build/zstd -19 -c build/tars/lua.tar
 zstd-19-sqlite       -q                            build/zstd -19 -c build/tars/sqlite.tar
@@ -40,6 +41,10 @@ clone-neovim         -p build/git                  scripts/workloads/clone neovi
 gcc-git              -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc git
 gcc-lua              -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc lua
 gcc-sqlite           -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc sqlite
+gcc-curl             -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc curl
+gcc-neovim           -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc neovim
 clang-git            -q -p build/clang -c 1000003  scripts/workloads/compile clang git
 clang-lua            -q -p build/clang -c 1000003  scripts/workloads/compile clang lua
 clang-sqlite         -q -p build/clang -c 1000003  scripts/workloads/compile clang sqlite
+clang-curl           -q -p build/clang -c 1000003  scripts/workloads/compile clang curl
+clang-neovim         -q -p build/clang -c 1000003  scripts/workloads/compile clang neovim

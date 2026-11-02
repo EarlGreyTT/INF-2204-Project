@@ -64,7 +64,7 @@
 #
 # Time runs by hand, from two terminals:
 #   sudo scripts/tune hold
-#   sudo scripts/record time -n t14 -w quicksort-100m ./build/quicksort 100000000
+#   sudo scripts/record time -n t14 -w zstd-3-silesia -q build/zstd -3 -c build/silesia
 #
 # A program that a command starts (here gcc's cc1, started by make);
 # the command must clean up first, or a second run has nothing to do:

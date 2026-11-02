@@ -8,10 +8,15 @@
 #
 # Usage:
 #   compile <compiler> <program>
+#   compile --prepare <compiler> <program>
 #
 #   <compiler>   gcc or clang (make gcc, make clang)
-#   <program>    git, lua or sqlite: the source code make data keeps in
-#                build/
+#   <program>    git, lua, sqlite, curl or neovim: the source code make
+#                data keeps in build/
+#   --prepare    for curl and neovim: run their configure step (cmake
+#                for Neovim) and keep the result
+#                in build/compile/<compiler>-<program>.tar (make
+#                compile-gcc and make compile-clang do this)
 #
 # Run it through record, which keeps only the processes of the compiler:
 #   sudo scripts/record time -n t14 -w gcc-lua -p build/cc1 scripts/workloads/compile gcc lua
@@ -22,6 +27,15 @@
 # of the compiler at a time) and removes it. measure empties
 # /tmp/inf2204.<user id>/ around the workloads; by hand, remove it with
 # rm -rf.
+#
+# curl and Neovim have a configure step (Neovim's is cmake), which runs
+# the compiler many times
+# on test programs; it is no part of what we measure. --prepare runs it
+# once, in the folder the runs build in (configure writes that absolute
+# path into the Makefiles), and keeps the configured tree with its
+# files' times; a run unpacks it there, and make does not configure
+# again. Both use the same compiler and flags, from this script. The
+# folder has the user's id in it: prepare as the user who runs measure.
 #
 # The flags are each program's own, plus ours: the hardening some
 # distributions' compilers add by themselves off, and the run folder
@@ -65,10 +79,15 @@ makefile_var() {
 	sed -n "s/^$1 = //p" "$REPO/Makefile"
 }
 
+PREPARE=
 case "${1:-}" in
 -h | --help)
 	usage_block
 	exit 0
+	;;
+--prepare)
+	PREPARE=1
+	shift
 	;;
 esac
 [ $# = 2 ] || {
@@ -109,13 +128,64 @@ case "$2" in
 git) src=$BUILD/git-$(makefile_var GIT_VERSION).tar.gz ;;
 lua) src=$BUILD/lua-$(makefile_var LUA_VERSION).tar.gz ;;
 sqlite) src=$BUILD/compile/sqlite ;;
-*) die "no program '$2': git, lua or sqlite" ;;
+curl) src=$BUILD/curl-$(makefile_var CURL_VERSION).tar.xz ;;
+neovim) src=$BUILD/tars/neovim.tar ;;
+*) die "no program '$2': git, lua, sqlite, curl or neovim" ;;
 esac
 [ -e "$src" ] || die_cmd "$src is missing" "make -C $REPO data"
+case "$2" in
+curl | neovim) configured=$BUILD/compile/$1-$2.tar ;;
+*) configured= ;;
+esac
+if [ -n "$PREPARE" ] && [ -z "$configured" ]; then
+	die "$2 has no configure step to prepare"
+fi
+if [ -z "$PREPARE" ] && [ -n "$configured" ]; then
+	[ -f "$configured" ] || die_cmd "$configured is missing" "make -C $REPO compile-$1"
+fi
 
 rm -rf "$DIR"
 mkdir -p "$DIR"
 cd "$DIR"
+
+if [ -n "$PREPARE" ]; then
+	case "$2" in
+	curl)
+		tar -xJf "$src" --strip-components=1
+		# curl's own CFLAGS (-O2) and ours; nothing optional: no TLS, no
+		# compression or other libraries, no manual
+		./configure --quiet CC="$CC" CFLAGS="-O2 $FLAGS" --disable-shared \
+			--without-ssl --without-zlib --without-brotli --without-zstd \
+			--without-libpsl --without-libidn2 --without-nghttp2 --without-nghttp3 \
+			--without-ngtcp2 --without-libssh2 --without-libssh --without-libgsasl \
+			--without-ca-bundle --without-ca-path --disable-ldap --disable-ldaps \
+			--disable-manual --disable-docs >/dev/null
+		;;
+	neovim)
+		tar -xf "$src"
+		# Neovim's release build type (-O2 -g) and ours; its libraries
+		# from make data. CC with its options: cmake keeps the options.
+		CC="$CC" CFLAGS="$FLAGS" cmake -S . -B build -G Ninja -Wno-dev \
+			-DCMAKE_BUILD_TYPE=RelWithDebInfo -DDEPS_PREFIX="$BUILD/neovim-deps/usr" >/dev/null
+		;;
+	esac
+	# the folder it was made for, which a run checks
+	printf '%s\n' "$DIR" >.prepared-for
+	mkdir -p "$BUILD/compile"
+	tar -cf "$configured.part" .
+	mv "$configured.part" "$configured"
+	cd /
+	rm -rf "$DIR"
+	exit 0
+fi
+
+if [ -n "$configured" ]; then
+	tar -xf "$configured"
+	[ "$(cat .prepared-for)" = "$DIR" ] ||
+		die_cmd "$configured was made for $(cat .prepared-for), not $DIR (another user?)" \
+			"rm $configured; make -C $REPO compile-$1"
+fi
+
 case "$2" in
 git)
 	[ -f "$BUILD/zlib/lib/libz.a" ] || die_cmd "$BUILD/zlib is missing" "make -C $REPO git"
@@ -143,6 +213,19 @@ sqlite)
 		-DSQLITE_ENABLE_FTS4 -DSQLITE_ENABLE_OFFSET_SQL_FUNC -DSQLITE_ENABLE_RTREE \
 		-DSQLITE_ENABLE_STMTVTAB -DSQLITE_ENABLE_UNKNOWN_SQL_FUNCTION -DSQLITE_STRICT_SUBTYPE=1 \
 		-o sqlite3 shell.c sqlite3.c -lm
+	;;
+curl)
+	# configured by --prepare with our compiler and flags: the library
+	# and the curl program. Not all of make: without shared libraries,
+	# curl's configure also builds the library a second time for its
+	# unit tests (libcurlu), and has no option to leave that out.
+	make -j1 -C lib libcurl.la
+	make -j1 -C src curl
+	;;
+neovim)
+	# configured by --prepare: the nvim program only, not its runtime
+	# files (help tags and the like, which the new nvim makes)
+	ninja -C build -j1 nvim_bin
 	;;
 esac
 cd /

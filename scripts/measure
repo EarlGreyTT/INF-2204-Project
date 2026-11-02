@@ -303,7 +303,15 @@ note "building $what and downloading their inputs (make; minutes the first time)
 if ! as_user sh -c 'exec >"$3" 2>&1; repo=$1 jobs=$2; shift 3
 	make -C "$repo" -j"$jobs" all || exit
 	for p; do make -C "$repo" -j"$jobs" "$p" || exit; done
-	make -C "$repo" data' sh \
+	make -C "$repo" data || exit
+	# the configure steps of the compile workloads (curl, Neovim), with
+	# our compilers, so after them and after the downloads
+	for p; do
+		case $p in
+		build/cc1) make -C "$repo" -j"$jobs" compile-gcc || exit ;;
+		build/clang) make -C "$repo" -j"$jobs" compile-clang || exit ;;
+		esac
+	done' sh \
 	"$REPO" "$(nproc)" "$LOG" $progs; then
 	tail -n 20 "$LOG" >&2
 	die "make failed; all of its output is in $LOG"

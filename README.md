@@ -9,13 +9,13 @@ that spread across programs and machines.
 Install the tools. On Ubuntu:
 
 ```sh
-sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib linux-tools-common linux-tools-$(uname -r)
+sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib cmake ninja-build linux-tools-common linux-tools-$(uname -r)
 ```
 
 On Debian or Raspberry Pi OS:
 
 ```sh
-sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib linux-perf
+sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib cmake ninja-build linux-perf
 ```
 
 Name your machine (letters, digits, _; the same name every time):

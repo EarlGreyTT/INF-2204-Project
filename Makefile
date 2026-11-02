@@ -7,21 +7,18 @@
 # options in force in each run's meta.txt.
 #
 #   make             everything
-#   make <program>   one program: quicksort, zstd, xz, sqlite, git or
-#                    magick (ImageMagick)
+#   make <program>   one program: zstd, xz, sqlite, git or magick
+#                    (ImageMagick)
 #   make clang       the C compilers, built from source: build/clang and
 #   make gcc         build/cc1 (gcc's compiler proper). Not part of
 #                    "make": each takes hours on a Raspberry Pi.
 #   make data        the files the programs are run on:
-#                    build/silesia  for zstd and xz: the Silesia corpus,
-#                                   a standard test set for compression,
-#                                   its 12 files joined into one (212 MB;
-#                                   the download is slow)
 #                    build/repo     for git: a repository whose three
 #                                   commits are three releases of git
-#                    build/bridge.ppm
-#                                   for ImageMagick: a photo from a set
-#                                   of test photos used in image
+#                    build/bridge.ppm, deer.ppm, big_tree.ppm and
+#                    artificial.ppm
+#                                   for ImageMagick: four images from a
+#                                   set of test photos used in image
 #                                   compression research (the download,
 #                                   346 MB, is of the whole set)
 #                    build/clones/  for the clone workloads: the history
@@ -34,6 +31,12 @@
 #                                   for the compile workloads: the
 #                                   source code they compile (git's is
 #                                   the download "make git" uses)
+#   make compile-gcc   for the compile workloads of programs with a
+#   make compile-clang configure step (curl, Neovim): that step, run
+#                    once with our gcc or clang, its result kept in
+#                    build/compile/<compiler>-<program>.tar. Needs the
+#                    compiler (it builds it if missing, so not part of
+#                    "make data") and the downloads of make data.
 #   make clean       remove build/
 #
 # Third-party programs: a pinned release, its download checked against
@@ -156,15 +159,24 @@ LUA_VERSION = 5.5.1
 LUA_SHA256 = 1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce
 LUA_URL = https://www.lua.org/ftp/lua-$(LUA_VERSION).tar.gz
 
-# no published checksum: this is the SHA-256 of our first download
-# (2026-09-27)
-SILESIA_SHA256 = 0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af
-SILESIA_URL = https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
+# the release, not our tar of the repository: it has the generated
+# configure, which in the repository autoreconf would make, differently
+# with each machine's autotools. No published checksum: the SHA-256 of
+# our first download (2026-11-01, the same downloaded on a Pi)
+CURL_VERSION = 8.23.0
+CURL_SHA256 = 8dadd7d2536a314f982ad05a651b713f426bf7d02cc2c76cffb9796f2218e6c5
+CURL_URL = https://curl.se/download/curl-$(CURL_VERSION).tar.xz
 
-# no published checksum either: the SHA-256 of our first download
-# (2026-10-26)
+# the compile workloads with a configure step, and so a prepared tree
+CONFIGURED = curl neovim
+
+# no published checksum: the SHA-256 of our first download (2026-10-26)
 IMAGES_SHA256 = 16c273504425923259b1ddf8e39dfa9cb27585d249f6263cfc6bea39cfafa660
 IMAGES_URL = https://imagecompression.info/test_images/rgb8bit.zip
+# the images taken from it: a portrait 2749 x 4049 (11 megapixels), a
+# landscape 4043 x 2641 (11 megapixels), a large one, 6088 x 4550 (28
+# megapixels), and a computer-made image, 3072 x 2048 (6 megapixels)
+PHOTOS = bridge deer big_tree artificial
 
 # The repositories for the clone workloads: the history up to one
 # release (the commit its tag points to), packed by our git. The pack
@@ -200,9 +212,8 @@ TAR_SHA256_sqlite = 20a52c48ccfc5b5c47cd77fe58d6397887732d95fe59631ee5253217e975
 TAR_SHA256_curl = 65a992eebdfe630fcf3f8b946cbac0d0d16c9b647b2f2da0b0c96f9b6c0d9e0d
 TAR_SHA256_neovim = e241cc128c99fb0043f0697cb7c2d8a588b933575c58b7ff9b35f4c18c2d9871
 
-all: quicksort zstd xz sqlite git magick
+all: zstd xz sqlite git magick
 
-quicksort: $(BUILD)/quicksort
 zstd: $(BUILD)/zstd
 xz: $(BUILD)/xz
 sqlite: $(BUILD)/speedtest1
@@ -210,9 +221,12 @@ git: $(BUILD)/git
 magick: $(BUILD)/magick
 clang: $(BUILD)/clang
 gcc: $(BUILD)/cc1
-data: $(BUILD)/silesia $(BUILD)/repo $(BUILD)/bridge.ppm $(foreach c,$(CLONES),$(BUILD)/clones/$(c).git) \
+data: $(BUILD)/repo $(foreach p,$(PHOTOS),$(BUILD)/$(p).ppm) $(foreach c,$(CLONES),$(BUILD)/clones/$(c).git) \
 	$(foreach c,$(CLONES),$(BUILD)/tars/$(c).tar) $(BUILD)/git-$(GIT_VERSION).tar.gz \
-	$(BUILD)/lua-$(LUA_VERSION).tar.gz $(BUILD)/compile/sqlite
+	$(BUILD)/lua-$(LUA_VERSION).tar.gz $(BUILD)/compile/sqlite $(BUILD)/curl-$(CURL_VERSION).tar.xz \
+	$(BUILD)/neovim-deps
+compile-gcc: $(foreach p,$(CONFIGURED),$(BUILD)/compile/gcc-$(p).tar)
+compile-clang: $(foreach p,$(CONFIGURED),$(BUILD)/compile/clang-$(p).tar)
 
 # fetch url sha256: downloads to $@, kept only if the checksum matches
 define fetch
@@ -223,9 +237,6 @@ endef
 
 # every build also depends on this Makefile, so a change of flags
 # rebuilds the programs
-$(BUILD)/quicksort: src/quicksort.c Makefile | $(BUILD)
-	$(BUILDENV) $(CC) $(CFLAGS) -o $@ src/quicksort.c
-
 $(BUILD)/zstd-$(ZSTD_VERSION).tar.gz: | $(BUILD)
 	$(call fetch,$(ZSTD_URL),$(ZSTD_SHA256))
 
@@ -426,20 +437,11 @@ $(BUILD)/cc1: $(BUILD)/gcc-$(GCC_VERSION).tar.xz $(BUILD)/gmp-$(GMP_VERSION).tar
 	$(BUILDENV) $(MAKE) -C $(BUILD)/gcc-build all-gcc
 	cp $(BUILD)/gcc-build/gcc/cc1 $@
 
-$(BUILD)/silesia.zip: | $(BUILD)
-	$(call fetch,$(SILESIA_URL),$(SILESIA_SHA256))
-
-# the files in the archive's order (alphabetical)
-$(BUILD)/silesia: $(BUILD)/silesia.zip
-	unzip -p $< > $@.part
-	mv $@.part $@
-
 $(BUILD)/rgb8bit.zip: | $(BUILD)
 	$(call fetch,$(IMAGES_URL),$(IMAGES_SHA256))
 
-# one photo of a common size: 2749 x 4049 pixels (11 megapixels)
-$(BUILD)/bridge.ppm: $(BUILD)/rgb8bit.zip
-	unzip -p $< bridge.ppm > $@.part
+$(foreach p,$(PHOTOS),$(BUILD)/$(p).ppm): $(BUILD)/%.ppm: $(BUILD)/rgb8bit.zip
+	unzip -p $< $*.ppm > $@.part
 	mv $@.part $@
 
 # Both gits run without the settings of the user or the system
@@ -495,10 +497,44 @@ $(BUILD)/compile/sqlite: $(BUILD)/speedtest1
 	cp $(SQLITE_SRC)/sqlite3.c $(SQLITE_SRC)/sqlite3.h $(SQLITE_SRC)/shell.c $@.part
 	mv $@.part $@
 
+$(BUILD)/curl-$(CURL_VERSION).tar.xz: | $(BUILD)
+	$(call fetch,$(CURL_URL),$(CURL_SHA256))
+
+# For the compile workloads of Neovim: the libraries it is linked with
+# (libuv, LuaJIT, luv, lpeg, unibilium, utf8proc, tree-sitter), built
+# by its own cmake.deps from the downloads named, with SHA-256s, in its
+# cmake.deps/deps.txt, with the system's compiler: the runs compile
+# Neovim's own code only. Not the tree-sitter parsers: Neovim loads
+# them at run time; its build does not need them. Needs cmake and ninja
+# (apt install cmake ninja-build).
+# Built in place (the libraries' files name the folder), removed if the
+# build fails, so that a half-built one is not taken as done.
+$(BUILD)/neovim-deps: $(BUILD)/tars/neovim.tar Makefile
+	rm -rf $@ $@.src
+	mkdir $@.src
+	tar -xf $< -C $@.src
+	{ $(BUILDENV) cmake -S $@.src/cmake.deps -B $@ -G Ninja -Wno-dev \
+		-DCMAKE_BUILD_TYPE=Release -DUSE_BUNDLED_TS_PARSERS=OFF >/dev/null && \
+	  $(BUILDENV) cmake --build $@ >/dev/null; } || { rm -rf $@; exit 1; }
+	rm -rf $@.src
+
+# For the compile workloads with a configure step: that step, with the
+# compiler the runs use, in the folder they build in (configure writes
+# its absolute path into the Makefiles), kept as a tar with the files'
+# times, so that make in a run does not configure again. A run unpacks
+# it there and runs make. scripts/workloads/compile does both, so the
+# compiler and flags are the same.
+$(BUILD)/compile/gcc-curl.tar $(BUILD)/compile/clang-curl.tar: $(BUILD)/curl-$(CURL_VERSION).tar.xz
+$(BUILD)/compile/gcc-neovim.tar $(BUILD)/compile/clang-neovim.tar: $(BUILD)/tars/neovim.tar $(BUILD)/neovim-deps
+$(BUILD)/compile/gcc-%.tar: $(BUILD)/cc1 scripts/workloads/compile Makefile
+	$(BUILDENV) scripts/workloads/compile --prepare gcc $*
+$(BUILD)/compile/clang-%.tar: $(BUILD)/clang scripts/workloads/compile Makefile
+	$(BUILDENV) scripts/workloads/compile --prepare clang $*
+
 $(BUILD):
 	mkdir -p $@
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all quicksort zstd xz sqlite git magick clang gcc data clean
+.PHONY: all zstd xz sqlite git magick clang gcc data compile-gcc compile-clang clean
