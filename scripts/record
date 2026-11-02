@@ -29,7 +29,7 @@
 #                software), e.g. t14
 #   -w <workload>
 #                a name for what is measured: the program with its
-#                settings and input, e.g. zstd-3-silesia; the folder its
+#                settings and input, e.g. zstd-19-lua; the folder its
 #                runs go in. Runs of another command need another name.
 #   -r <runs>    how many time runs to record (default 1)
 #   -u           untuned baseline: skip tune, run the program anywhere
@@ -64,7 +64,7 @@
 #
 # Time runs by hand, from two terminals:
 #   sudo scripts/tune hold
-#   sudo scripts/record time -n t14 -w zstd-3-silesia -q build/zstd -3 -c build/silesia
+#   sudo scripts/record time -n t14 -w zstd-19-lua -q build/zstd -19 -c build/tars/lua.tar
 #
 # A program that a command starts (here gcc's cc1, started by make);
 # the command must clean up first, or a second run has nothing to do:
@@ -250,6 +250,21 @@ install_hint() {
 	fi
 }
 
+# need_ac: stops on battery power
+need_ac() {
+	# no power supply entries at all: a desktop
+	_ac=desktop
+	for _f in /sys/class/power_supply/*/online; do
+		[ -r "$_f" ] || continue
+		if [ "$(cat "$_f")" = 1 ]; then
+			_ac=1
+		elif [ "$_ac" = desktop ]; then
+			_ac=0
+		fi
+	done
+	[ "$_ac" != 0 ] || die "no AC adapter detected -- plug in the power cable; on battery the CPU clock can drop mid-run"
+}
+
 # need_python: rank's needs, checked before a run starts
 need_python() {
 	have python3 || die_cmd "python3 is not installed" "$(install_hint python3 python3 python)"
@@ -292,7 +307,7 @@ check_nick() {
 # check_workload name: a folder name of its own, not a path
 check_workload() {
 	case "$1" in
-	"") die "a workload name is required, e.g. -w zstd-3-silesia" ;;
+	"") die "a workload name is required, e.g. -w zstd-19-lua" ;;
 	platforms) die "'platforms' cannot be a workload's name: that folder holds the platform files" ;;
 	[!A-Za-z0-9]* | *[!A-Za-z0-9_.-]*) die "workload '$1' may only contain letters, digits, _ . and -, and must start with a letter or digit" ;;
 	esac
@@ -743,13 +758,17 @@ rank_levels() {
 	rm "$STAGE/rank-warnings"
 }
 
-# finish_run: moves the run's files out of failed/ as <run>.<name>.
+# finish_run: moves the run's files out of failed/ as <run>.<name>;
+# meta.txt last: it marks the run as done
 finish_run() {
 	for f in "$STAGE"/*; do
 		[ -e "$f" ] || continue
+		[ "${f##*/}" != meta.txt ] || continue
 		own "$f"
 		mv "$f" "$RUN_DIR/$RUN.${f##*/}"
 	done
+	own "$STAGE/meta.txt"
+	mv "$STAGE/meta.txt" "$RUN_DIR/$RUN.meta.txt"
 	rmdir "$STAGE"
 	STAGE=
 	rmdir "$RUN_DIR/failed" 2>/dev/null || true
@@ -793,6 +812,11 @@ record_all() {
 	check_command "$MDIR"
 
 	need_root "tuning and perf need it"
+	# record time's checks, here too, so that they fail before the
+	# system is tuned and the warm-up has run
+	have perf || die_cmd "perf is not installed" "$(perf_hint)"
+	need_python
+	need_ac
 	have setpriv || die_cmd "setpriv is not installed" "$(install_hint util-linux util-linux util-linux)"
 	SETPRIV=$(command -v setpriv)
 	if [ -z "$UNTUNED" ] && ! have systemd-run; then
@@ -926,17 +950,7 @@ record_time() {
 		die "systemd-run is missing; it is needed to start the program in tune.slice"
 	fi
 
-	# no power supply entries at all: a desktop
-	ac=desktop
-	for f in /sys/class/power_supply/*/online; do
-		[ -r "$f" ] || continue
-		if [ "$(cat "$f")" = 1 ]; then
-			ac=1
-		elif [ "$ac" = desktop ]; then
-			ac=0
-		fi
-	done
-	[ "$ac" != 0 ] || die "no AC adapter detected -- plug in the power cable; on battery the CPU clock can drop mid-run"
+	need_ac
 
 	need_root "perf needs it, and so does starting the program in tune.slice"
 
@@ -1022,7 +1036,9 @@ for an untuned baseline run."
 	fi
 	status=$(cat "$STAGE/status")
 	rm "$STAGE/status"
-	[ "$status" = 0 ] || program_failed "$status" "the program (or what starts it: systemd-run, env, setpriv)"
+	what=program
+	[ -z "$STARTER" ] || what=command
+	[ "$status" = 0 ] || program_failed "$status" "the $what (or what starts it: systemd-run, env, setpriv)"
 
 	# One line per sample: "tid [cpu] seconds.nanoseconds: period ip
 	# (file)". The clock comes from the gaps between a thread's samples:
@@ -1187,23 +1203,33 @@ $PROG itself (for git: --exec-path; for gcc: -B)."
 # own files into callgrind/; rank collect sums the processes that ran
 # the program as they end and removes the files (a build writes
 # gigabytes otherwise), into counts.sum.gz. If the collector fails, the
-# command is stopped.
+# command is stopped; if record is killed outright, the collector stops
+# the command.
+#
+# --dump-before=_Fork: a fork's child starts with its parent's counts
+# (callgrind copies them), so the parent writes what it counted so far
+# before each fork and starts from zero (glibc 2.34 and later fork
+# through _Fork); rank collect adds the parts up.
+#
+# Started with &, the command would have SIGINT and SIGQUIT ignored;
+# env gives them back. Its stdin is /dev/null, as in the other count.
 count_processes() {
 	CG=$STAGE/callgrind
 	mkdir "$CG"
 	# setsid: its own process group, to stop it with all it started;
 	# started from a script, setsid runs in place, so $! is that group
 	# word splitting intended: ENVIRONMENT is a list of settings
-	setsid env -i $ENVIRONMENT \
+	setsid env -i --default-signal=INT,QUIT $ENVIRONMENT \
 		"$VALGRIND" -v -v -v --tool=callgrind --dump-instr=yes --skip-plt=no \
-		--collect-jumps=yes --trace-children=yes \
+		--collect-jumps=yes --trace-children=yes --dump-before=_Fork \
 		--trace-children-skip='*/as,*/ld,*/ld.*,*/collect2,*/ar,*/ranlib,*-linux-gnu-as,*-linux-gnu-ld,*-linux-gnu-ld.*,*-linux-gnu-ar,*-linux-gnu-ranlib' \
 		--callgrind-out-file="$CG/callgrind.%p.out" --log-file="$CG/valgrind.%p.log" \
-		"$@" >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" &
+		"$@" </dev/null >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" &
 	VG_GROUP=$!
 	{
 		rc=0
-		"$SCRIPTS/rank" collect "$CG" "$PROG" "$STAGE/counts.sum.gz" 2>"$STAGE/collect.log" || rc=$?
+		"$SCRIPTS/rank" collect -p "$$" -g "$VG_GROUP" "$CG" "$PROG" "$STAGE/counts.sum.gz" \
+			2>"$STAGE/collect.log" || rc=$?
 		if [ "$rc" != 0 ] && [ ! -e "$CG/finished" ]; then
 			kill -s TERM -- "-$VG_GROUP" 2>/dev/null || true
 			rc="$rc stopped"
@@ -1213,7 +1239,12 @@ count_processes() {
 	COLLECTOR=$!
 	status=0
 	wait "$VG_GROUP" || status=$?
+	# what the command started and left running would count on after
+	# the run
+	left=$(pgrep -g "$VG_GROUP" -d ' ' || true)
+	kill -s TERM -- "-$VG_GROUP" 2>/dev/null || true
 	VG_GROUP=
+	[ -z "$left" ] || die "the command ended, but processes it started still ran ($left); they were stopped"
 	touch "$CG/finished"
 	wait "$COLLECTOR" || true
 	COLLECTOR=
@@ -1223,7 +1254,7 @@ count_processes() {
 	*stopped) die "summing the counts failed, so the command was stopped: $(cat "$STAGE/collect.log")" ;;
 	esac
 	# a failed command leaves counts unfinished: that is the cause
-	[ "$status" = 0 ] || program_failed "$status"
+	[ "$status" = 0 ] || program_failed "$status" "the command"
 	[ "$rc" = 0 ] || die "summing the counts failed: $(cat "$STAGE/collect.log")"
 	rm "$CG/finished"
 	rmdir "$CG"
@@ -1278,7 +1309,7 @@ record_count() {
 			"$VALGRIND" -v -v -v --tool=callgrind --dump-instr=yes --skip-plt=no \
 			--collect-jumps=yes \
 			--callgrind-out-file="$STAGE/callgrind.out" --log-file="$STAGE/valgrind.log" \
-			"$PROG" "$@" >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" || status=$?
+			"$PROG" "$@" </dev/null >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" || status=$?
 		[ "$status" = 0 ] || program_failed "$status"
 		rank_run count counts "$STAGE/callgrind.out" "$STAGE/valgrind.log"
 	else

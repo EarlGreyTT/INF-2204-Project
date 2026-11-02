@@ -144,7 +144,17 @@ if [ -z "$PREPARE" ] && [ -n "$configured" ]; then
 	[ -f "$configured" ] || die_cmd "$configured is missing" "make -C $REPO compile-$1"
 fi
 
+# /tmp is everyone's: the folder must be this user's own, or another
+# user could change the sources between unpacking and building
+TMP=/tmp/inf2204.$(id -u)
+mkdir -m 700 -p "$TMP"
+[ -O "$TMP" ] && [ ! -L "$TMP" ] || die "$TMP is not your own folder; remove it, as its owner"
 rm -rf "$DIR"
+# a stopped or failed build leaves nothing in /tmp (RAM on most machines)
+trap 'cd / && rm -rf "$DIR"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$DIR"
 cd "$DIR"
 
@@ -165,8 +175,11 @@ if [ -n "$PREPARE" ]; then
 		tar -xf "$src"
 		# Neovim's release build type (-O2 -g) and ours; its libraries
 		# from make data. CC with its options: cmake keeps the options.
+		# CACHE_PRG=OFF: Neovim would build through ccache or sccache
+		# wherever one is installed, and a cached file runs no compiler.
 		CC="$CC" CFLAGS="$FLAGS" cmake -S . -B build -G Ninja -Wno-dev \
-			-DCMAKE_BUILD_TYPE=RelWithDebInfo -DDEPS_PREFIX="$BUILD/neovim-deps/usr" >/dev/null
+			-DCMAKE_BUILD_TYPE=RelWithDebInfo -DDEPS_PREFIX="$BUILD/neovim-deps/usr" \
+			-DCACHE_PRG=OFF >/dev/null
 		;;
 	esac
 	# the folder it was made for, which a run checks

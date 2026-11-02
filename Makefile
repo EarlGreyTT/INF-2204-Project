@@ -68,8 +68,8 @@ CFLAGS += -fno-stack-protector -fno-stack-clash-protection -fcf-protection=none 
 # either.
 CXX = g++
 COMPILER_CFLAGS = $(patsubst -g,-g1,$(CFLAGS))
-# how many files ninja (clang's build) compiles at once; it does not take
-# make's -j. Some of clang's files need 1-2 GB of memory each.
+# how many files the compilers' builds compile at once, whatever make's
+# -j: some of their files need 1-2 GB of memory each.
 COMPILER_JOBS = 4
 
 ifneq ($(words $(CURDIR)),1)
@@ -224,7 +224,7 @@ gcc: $(BUILD)/cc1
 data: $(BUILD)/repo $(foreach p,$(PHOTOS),$(BUILD)/$(p).ppm) $(foreach c,$(CLONES),$(BUILD)/clones/$(c).git) \
 	$(foreach c,$(CLONES),$(BUILD)/tars/$(c).tar) $(BUILD)/git-$(GIT_VERSION).tar.gz \
 	$(BUILD)/lua-$(LUA_VERSION).tar.gz $(BUILD)/compile/sqlite $(BUILD)/curl-$(CURL_VERSION).tar.xz \
-	$(BUILD)/neovim-deps
+	$(BUILD)/neovim-deps/done check-inputs
 compile-gcc: $(foreach p,$(CONFIGURED),$(BUILD)/compile/gcc-$(p).tar)
 compile-clang: $(foreach p,$(CONFIGURED),$(BUILD)/compile/clang-$(p).tar)
 
@@ -434,7 +434,7 @@ $(BUILD)/cc1: $(BUILD)/gcc-$(GCC_VERSION).tar.xz $(BUILD)/gmp-$(GMP_VERSION).tar
 		CC="$(CC)" CXX="$(CXX)" CFLAGS="$(COMPILER_CFLAGS)" CXXFLAGS="$(COMPILER_CFLAGS)" \
 		--prefix=/nonexistent --enable-languages=c --disable-bootstrap --disable-multilib \
 		--disable-nls --disable-lto --disable-plugin --without-isl --without-zstd
-	$(BUILDENV) $(MAKE) -C $(BUILD)/gcc-build all-gcc
+	$(BUILDENV) $(MAKE) -C $(BUILD)/gcc-build -j $(COMPILER_JOBS) all-gcc
 	cp $(BUILD)/gcc-build/gcc/cc1 $@
 
 $(BUILD)/rgb8bit.zip: | $(BUILD)
@@ -476,6 +476,27 @@ $(BUILD)/clones/%.git: | $(BUILD)/git
 	echo "$(CLONE_PACK_SHA256_$*)  $$(echo $@.part/objects/pack/*.pack)" | sha256sum -c --quiet
 	mv $@.part $@
 
+# The repositories, their tars and the photo set are made once and kept,
+# under names without their pin: after a pin above changes, the old ones
+# would stay without a word, and machines would measure different inputs.
+# So make data checks them each time (seconds).
+check-inputs:
+	@$(foreach c,$(CLONES),\
+	if [ -d $(BUILD)/clones/$(c).git ] && \
+		{ [ "$$($(CLONE_GIT) -C $(BUILD)/clones/$(c).git rev-parse main)" != $(CLONE_COMMIT_$(c)) ] || \
+		! echo "$(CLONE_PACK_SHA256_$(c))  $$(echo $(BUILD)/clones/$(c).git/objects/pack/*.pack)" | \
+			sha256sum -c --quiet >/dev/null 2>&1; }; then \
+		printf '%s\n\n%s\n\n' "$(BUILD)/clones/$(c).git is not the pinned one; fix it with:" \
+			"rm -rf $(BUILD)/clones/$(c).git $(BUILD)/tars/$(c).tar"; exit 1; fi; \
+	if [ -f $(BUILD)/tars/$(c).tar ] && \
+		! echo "$(TAR_SHA256_$(c))  $(BUILD)/tars/$(c).tar" | sha256sum -c --quiet >/dev/null 2>&1; then \
+		printf '%s\n\n%s\n\n' "$(BUILD)/tars/$(c).tar is not the pinned one; fix it with:" \
+			"rm $(BUILD)/tars/$(c).tar"; exit 1; fi;)
+	@if [ -f $(BUILD)/rgb8bit.zip ] && \
+		! echo "$(IMAGES_SHA256)  $(BUILD)/rgb8bit.zip" | sha256sum -c --quiet >/dev/null 2>&1; then \
+		printf '%s\n\n%s\n\n' "$(BUILD)/rgb8bit.zip is not the pinned one; fix it with:" \
+			"rm $(BUILD)/rgb8bit.zip $(foreach p,$(PHOTOS),$(BUILD)/$(p).ppm)"; exit 1; fi
+
 $(BUILD)/tars/%.tar: $(BUILD)/clones/%.git
 	mkdir -p $(BUILD)/tars
 	$(CLONE_GIT) --git-dir=$< archive --format=tar main > $@.part
@@ -509,14 +530,18 @@ $(BUILD)/curl-$(CURL_VERSION).tar.xz: | $(BUILD)
 # (apt install cmake ninja-build).
 # Built in place (the libraries' files name the folder), removed if the
 # build fails, so that a half-built one is not taken as done.
-$(BUILD)/neovim-deps: $(BUILD)/tars/neovim.tar Makefile
-	rm -rf $@ $@.src
-	mkdir $@.src
-	tar -xf $< -C $@.src
-	{ $(BUILDENV) cmake -S $@.src/cmake.deps -B $@ -G Ninja -Wno-dev \
-		-DCMAKE_BUILD_TYPE=Release -DUSE_BUNDLED_TS_PARSERS=OFF >/dev/null && \
-	  $(BUILDENV) cmake --build $@ >/dev/null; } || { rm -rf $@; exit 1; }
-	rm -rf $@.src
+# done is written last: a build stopped part-way leaves a folder that
+# make would otherwise take for finished. CACHE_PRG=OFF: Neovim's build
+# would use ccache or sccache wherever one is installed.
+$(BUILD)/neovim-deps/done: $(BUILD)/tars/neovim.tar Makefile
+	rm -rf $(BUILD)/neovim-deps $(BUILD)/neovim-deps.src
+	mkdir $(BUILD)/neovim-deps.src
+	tar -xf $< -C $(BUILD)/neovim-deps.src
+	{ $(BUILDENV) cmake -S $(BUILD)/neovim-deps.src/cmake.deps -B $(BUILD)/neovim-deps -G Ninja \
+		-Wno-dev -DCMAKE_BUILD_TYPE=Release -DUSE_BUNDLED_TS_PARSERS=OFF -DCACHE_PRG=OFF >/dev/null && \
+	  $(BUILDENV) cmake --build $(BUILD)/neovim-deps >/dev/null; } || { rm -rf $(BUILD)/neovim-deps; exit 1; }
+	rm -rf $(BUILD)/neovim-deps.src
+	touch $@
 
 # For the compile workloads with a configure step: that step, with the
 # compiler the runs use, in the folder they build in (configure writes
@@ -525,7 +550,7 @@ $(BUILD)/neovim-deps: $(BUILD)/tars/neovim.tar Makefile
 # it there and runs make. scripts/workloads/compile does both, so the
 # compiler and flags are the same.
 $(BUILD)/compile/gcc-curl.tar $(BUILD)/compile/clang-curl.tar: $(BUILD)/curl-$(CURL_VERSION).tar.xz
-$(BUILD)/compile/gcc-neovim.tar $(BUILD)/compile/clang-neovim.tar: $(BUILD)/tars/neovim.tar $(BUILD)/neovim-deps
+$(BUILD)/compile/gcc-neovim.tar $(BUILD)/compile/clang-neovim.tar: $(BUILD)/tars/neovim.tar $(BUILD)/neovim-deps/done
 $(BUILD)/compile/gcc-%.tar: $(BUILD)/cc1 scripts/workloads/compile Makefile
 	$(BUILDENV) scripts/workloads/compile --prepare gcc $*
 $(BUILD)/compile/clang-%.tar: $(BUILD)/clang scripts/workloads/compile Makefile
@@ -537,4 +562,4 @@ $(BUILD):
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all zstd xz sqlite git magick clang gcc data compile-gcc compile-clang clean
+.PHONY: all zstd xz sqlite git magick clang gcc data check-inputs compile-gcc compile-clang clean

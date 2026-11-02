@@ -8,9 +8,11 @@
 #
 # Usage:
 #   measure -n <nick> [-r <runs>] [-u] [-c <cycles>] [-m <dir>]
-#           [-j <counts>] all
+#           [-j <counts>] [-s] all
 #   measure -n <nick> [-r <runs>] [-u] [-c <cycles>] [-m <dir>]
-#           [-j <counts>] <workload>...
+#           [-j <counts>] [-s] <workload>...
+#   measure -n <nick> [-m <dir>] [-j <counts>] [-s] count all
+#   measure -n <nick> [-m <dir>] [-j <counts>] [-s] count <workload>...
 #
 #   all          build the programs, download their inputs (about
 #                1.5 GB the first time), then record every workload in
@@ -18,14 +20,19 @@
 #                (record all -t: a warm-up run, then the time runs, on
 #                the tuned system), then one count of each, several at
 #                a time, untuned (counts are exact; callgrind is slow);
-#                as root
+#                the slow counts (marked -s in workloads.txt) start
+#                only when all the others have ended; as root
 #   <workload>   the same for only these workloads
+#   count        only the counts, no time runs: e.g. the ones a
+#                stopped run, or -s, left out
 #
 #   -n <nick>    your machine's short name, e.g. t14; the same every time
+#   -s           leave out the slow counts (their time runs still run);
+#                the end prints the command that counts them
 #   -j <counts>  how many counts run at most at once (default 3, at most
 #                the number of CPUs minus one); each takes about 1.5
 #                CPUs and up to a few GB of memory, so another starts
-#                only while 4 GB are free
+#                only while 4 GB are free, and a minute after the last
 #   -r, -u, -c and -m are record's: see scripts/record -h
 #
 # Counts must not take all the memory: a Raspberry Pi with 8 GB hung for
@@ -40,11 +47,13 @@
 # The build runs as the user who ran sudo; record runs from the repo's
 # folder. It also builds the programs given with -p in build/ (the
 # compilers, for the compile workloads), only if one of the chosen
-# workloads needs them: that takes hours on a Raspberry Pi. A workload that fails does not stop the others; Ctrl-C stops
-# them all. If any failed or did not run, the end prints the command
-# that runs just those. Such a rerun records a workload again in full:
-# its good runs from before stay, so it can end up with more runs than
-# the others.
+# workloads needs them: that takes hours on a Raspberry Pi.
+#
+# A workload that fails does not stop the others; Ctrl-C stops them all,
+# and what has ended stays. If any failed or did not run, the end prints
+# the commands that run just those: in full if their time runs are not
+# done (the good runs from before stay, so a workload can end up with
+# more runs than the others), else only their counts.
 #
 # The counts' output goes to a log per workload, under /tmp; the
 # terminal gets one line when each starts and ends.
@@ -117,9 +126,34 @@ workload_lines() {
 	sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$WORKLOADS"
 }
 
-# workload_line name: the words after the name on its line
+# workload_line name: the words after the name on its line, for
+# record: without measure's own -s
 workload_line() {
-	workload_lines | awk -v w="$1" '$1 == w { $1 = ""; sub(/^ +/, ""); print; exit }'
+	workload_lines | awk -v w="$1" '$1 == w {
+		out = ""
+		opts = 1
+		for (i = 2; i <= NF; i++) {
+			if (opts && $i == "-s") continue
+			if (opts && ($i == "-p" || $i == "-c")) { out = out " " $i " " $(i + 1); i++; continue }
+			if ($i !~ /^-/) opts = 0
+			out = out " " $i
+		}
+		print substr(out, 2)
+		exit
+	}'
+}
+
+# is_slow name: prints "slow" if the workload's line has -s among its
+# options (its count runs last; see the header)
+is_slow() {
+	workload_lines | awk -v w="$1" '$1 == w {
+		for (i = 2; i <= NF; i++) {
+			if ($i == "-s") { print "slow"; exit }
+			if ($i == "-p" || $i == "-c") { i++; continue }
+			if ($i !~ /^-/) exit
+		}
+		exit
+	}'
 }
 
 # as_user command...: runs it as the user who ran sudo
@@ -146,13 +180,15 @@ free_mb() {
 	awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo
 }
 
-# kill_tree pid: stops a process and everything it started, children
-# first (a count's callgrind runs in a session of its own)
-kill_tree() {
+# stop_count pid: stops the count a count's subshell (pid) started:
+# TERM to its child (sudo, which passes it on to record, or record),
+# which stops its callgrind and cleans up. Not the subshell: it writes
+# the count's status once record has ended. Not record's own children:
+# record stops them, and a second TERM would cut its cleanup short.
+stop_count() {
 	for _c in $(pgrep -P "$1"); do
-		kill_tree "$_c"
+		kill -s TERM "$_c" 2>/dev/null || true
 	done
-	kill -s TERM "$1" 2>/dev/null || true
 }
 
 # drop word list: the list without that word
@@ -179,10 +215,11 @@ SCRATCH=
 PERIOD=
 MDIR=
 JOBS=
+SKIP=
 # the counts running: their subshells' pids, and their logs' folder
 COUNTING=
 LOGS=
-while getopts n:r:uc:m:j: opt; do
+while getopts n:r:uc:m:j:s opt; do
 	case "$opt" in
 	n) NICK=$OPTARG ;;
 	r) RUNS=$OPTARG ;;
@@ -190,10 +227,17 @@ while getopts n:r:uc:m:j: opt; do
 	c) PERIOD=$OPTARG ;;
 	m) MDIR=$OPTARG ;;
 	j) JOBS=$OPTARG ;;
+	s) SKIP=-s ;;
 	*) usage ;;
 	esac
 done
 shift $((OPTIND - 1))
+MODE=all
+if [ "${1:-}" = count ]; then
+	MODE=count
+	shift
+	[ -z "$RUNS$UNTUNED$PERIOD" ] || die "count runs no time runs, so it takes no -r, -u or -c"
+fi
 [ $# -ge 1 ] || usage
 
 # the same checks as record's, here so that a mistake shows before the
@@ -227,7 +271,7 @@ esac
 known=
 for w in $(workload_lines | awk '{ print $1 }'); do
 	case "$w" in
-	all | platforms) die "workloads.txt: '$w' cannot be a workload's name" ;;
+	all | count | platforms) die "workloads.txt: '$w' cannot be a workload's name" ;;
 	[!A-Za-z0-9]* | *[!A-Za-z0-9_.-]*) die "workloads.txt: workload '$w' may only contain letters, digits, _ . and -, and must start with a letter or digit" ;;
 	esac
 	case " $known " in
@@ -247,15 +291,27 @@ else
 		*" $w "*) ;;
 		*) die "no workload '$w' in workloads.txt (these are: $known)" ;;
 		esac
-		todo="${todo:+$todo }$w"
+		case " $todo " in
+		*" $w "*) ;;
+		*) todo="${todo:+$todo }$w" ;;
+		esac
 	done
 fi
 
-# this command without its workloads, to print with the ones left over
-CMD="sudo $(quote "$0") -n $(quote "$NICK")${RUNS:+ -r $RUNS}${UNTUNED:+ -u}${PERIOD:+ -c $PERIOD}${MDIR:+ -m $(quote "$MDIR")} -j $JOBS"
+# commands: this command without its workloads, to print with the ones
+# left over; and the ones that only count
+commands() {
+	CMD="sudo $(quote "$0") -n $(quote "$NICK")${RUNS:+ -r $RUNS}${UNTUNED:+ -u}${PERIOD:+ -c $PERIOD}${MDIR:+ -m $(quote "$MDIR")} -j $JOBS"
+	CMD_COUNT="sudo $(quote "$0") -n $(quote "$NICK")${MDIR:+ -m $(quote "$MDIR")} -j $JOBS"
+	CMD_COUNT1="sudo $(quote "$0") -n $(quote "$NICK")${MDIR:+ -m $(quote "$MDIR")} -j 1"
+}
+commands
 
 if [ "$(id -u)" != 0 ]; then
-	die_cmd "must run as root (tuning and perf need it)" "$CMD $*"
+	if [ "$MODE" = count ]; then
+		die_cmd "must run as root (the counts' memory cap needs it)" "$CMD_COUNT${SKIP:+ -s} count $*"
+	fi
+	die_cmd "must run as root (tuning and perf need it)" "$CMD${SKIP:+ -s} $*"
 fi
 # also with -u: record time -u refuses a tuned system, and every
 # workload's time runs would fail
@@ -318,42 +374,86 @@ if ! as_user sh -c 'exec >"$3" 2>&1; repo=$1 jobs=$2; shift 3
 fi
 rm "$LOG"
 
-failed=
-left=$todo
-# On any end: the workloads that failed or did not run, and the command
-# that runs just those.
+# Workloads whose time runs are still to do, and those whose count is
+# (their time runs are done, or count was asked for); those that failed
+# in either; the slow counts left out by -s.
+if [ "$MODE" = count ]; then
+	left_time=
+	left_count=$todo
+else
+	left_time=$todo
+	left_count=
+fi
+failed_time=
+failed_count=
+skipped=
+# On any end: the workloads that failed or did not run, and the commands
+# that run just those: in full if their time runs are not done, else
+# only their counts.
 on_exit() {
 	status=$?
-	# the counts still running: sudo passes the signal on to record,
-	# which stops its callgrind
+	# nothing may cut this short: not a second Ctrl-C, not a failing rm
+	trap '' HUP INT TERM
+	set +e
+	# the counts still running; their subshells end when record has
 	for pid in $COUNTING; do
-		kill_tree "$pid"
+		stop_count "$pid"
 	done
 	for pid in $COUNTING; do
-		wait "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null
 	done
 	[ -z "$LOGS" ] || note "the counts' logs are in $LOGS"
 	[ -z "${SCRATCH:-}" ] || rm -rf "$SCRATCH"
-	again="$failed${failed:+${left:+ }}$left"
-	[ -n "$again" ] || return 0
-	if [ -n "$left" ]; then
-		echo "$NAME: stopped; not done: $left" >&2
+	# a count that ended just before the stop, not yet seen by the loop
+	if [ -n "$LOGS" ]; then
+		for w in $left_count; do
+			[ "$(cat "$LOGS/$w.status" 2>/dev/null)" != 0 ] || left_count=$(drop "$w" "$left_count")
+		done
 	fi
-	if [ -n "$failed" ]; then
-		echo "$NAME: failed: $failed (record's errors are above)" >&2
+	unfinished=$left_count
+	for w in $skipped; do
+		unfinished=$(drop "$w" "$unfinished")
+	done
+	full="$failed_time${failed_time:+${left_time:+ }}$left_time"
+	counts="$failed_count${failed_count:+${unfinished:+ }}$unfinished"
+	[ -n "$full$counts$skipped" ] || return 0
+	if [ -n "$left_time" ]; then
+		echo "$NAME: stopped; not measured: $left_time" >&2
 	fi
-	echo "" >&2
-	echo "run just these with:" >&2
-	echo "" >&2
-	echo "$CMD $again" >&2
-	echo "" >&2
+	if [ -n "$unfinished" ]; then
+		echo "$NAME: stopped; not counted: $unfinished" >&2
+	fi
+	if [ -n "$failed_time$failed_count" ]; then
+		echo "$NAME: failed: $failed_time${failed_time:+${failed_count:+ }}$failed_count (record's errors are above)" >&2
+	fi
+	if [ -n "$full$counts" ]; then
+		echo "" >&2
+		echo "run just these with:" >&2
+		echo "" >&2
+		[ -z "$full" ] || echo "$CMD${SKIP:+ -s} $full" >&2
+		[ -z "$counts" ] || echo "$CMD_COUNT${SKIP:+ -s} count $counts" >&2
+		echo "" >&2
+	fi
+	if [ -n "$skipped" ]; then
+		echo "" >&2
+		echo "$NAME: the slow counts were left out (-s); count them later with:" >&2
+		echo "" >&2
+		echo "$CMD_COUNT count $skipped" >&2
+		echo "" >&2
+	fi
+	# only slow counts left out, as asked: a normal end
+	[ -n "$full$counts" ] || return 0
 	[ "$status" != 0 ] || exit 1
 }
 trap on_exit EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 141' PIPE
-trap 'exit 143' TERM
+# A signal only notes itself; the loops stop at the next point where
+# their bookkeeping is complete (a workload's time runs just ended, a
+# count just started), so the commands printed at the end are right.
+STOP=
+trap 'STOP=129' HUP
+trap 'STOP=130' INT
+trap 'STOP=141' PIPE
+trap 'STOP=143' TERM
 
 cd "$REPO"
 SCRATCH=/tmp/inf2204.${SUDO_UID:-$(id -u)}
@@ -361,7 +461,7 @@ total=$(echo "$todo" | wc -w)
 
 # the time runs, one workload after the other
 i=0
-for w in $todo; do
+for w in $left_time; do
 	i=$((i + 1))
 	note "time runs, workload $i of $total: $w"
 	# word splitting intended: the line is a list of words
@@ -372,14 +472,17 @@ for w in $todo; do
 		${PERIOD:+-c} ${PERIOD:+"$PERIOD"} ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@" || status=$?
 	rm -rf "$SCRATCH"
 	case "$status" in
-	0) ;;
+	0)
+		left_count="${left_count:+$left_count }$w"
+		;;
 	# terminal closed, Ctrl-C, pipe closed, killed: stop the series
 	129 | 130 | 141 | 143) exit "$status" ;;
 	*)
-		failed="${failed:+$failed }$w"
-		left=$(drop "$w" "$left")
+		failed_time="${failed_time:+$failed_time }$w"
 		;;
 	esac
+	left_time=$(drop "$w" "$left_time")
+	[ -z "$STOP" ] || exit "$STOP"
 done
 
 # count w word...: one count of workload w, its line's words without
@@ -429,8 +532,22 @@ ooms() {
 	awk '$1 == "oom_kill" { print $2; exit }' /sys/fs/cgroup/inf2204counts.slice/memory.events 2>/dev/null || echo 0
 }
 
-# then the counts, up to JOBS at once
-pending=$left
+# then the counts, up to JOBS at once: the slow ones only when all the
+# others have ended, or not at all with -s
+fast=
+slow=
+for w in $left_count; do
+	if [ -n "$(is_slow "$w")" ]; then
+		slow="${slow:+$slow }$w"
+	else
+		fast="${fast:+$fast }$w"
+	fi
+done
+if [ -n "$SKIP" ]; then
+	skipped=$slow
+	slow=
+fi
+pending="$fast${fast:+${slow:+ }}$slow"
 if [ -n "$pending" ]; then
 	LOGS=$(mktemp -d /tmp/measure-counts.XXXXXX)
 	chmod 755 "$LOGS"
@@ -443,89 +560,118 @@ if [ -n "$pending" ]; then
 	if grep -qw memory /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then
 		systemctl set-property --runtime inf2204counts.slice MemoryMax="${cap}M" MemorySwapMax=0 ||
 			die "could not cap the counts' memory (systemctl set-property inf2204counts.slice)"
-		note "counts: $(echo "$pending" | wc -w), up to $JOBS at a time, untuned, in at most $cap MB of memory; logs in $LOGS"
+		note "counts: $(echo "$pending" | wc -w)${slow:+ ($(echo "$slow" | wc -w) slow, last)}, up to $JOBS at a time, untuned, in at most $cap MB of memory; logs in $LOGS"
 	else
 		JOBS=1
+		commands
 		note "warning: this kernel cannot cap memory (memory is not in /sys/fs/cgroup/cgroup.controllers; on a Raspberry Pi, cgroup_disable=memory in cmdline.txt), so the counts run one at a time"
-		note "counts: $(echo "$pending" | wc -w), one at a time, untuned; logs in $LOGS"
+		note "counts: $(echo "$pending" | wc -w)${slow:+ ($(echo "$slow" | wc -w) slow, last)}, one at a time, untuned; logs in $LOGS"
 	fi
 fi
 running=
 stopped=
 waited=
+started=0
 while [ -n "$pending" ] || [ -n "$running" ]; do
-	# a count starts with 2 GB free, beside others with 4 GB free
-	while [ -n "$pending" ] && [ "$(echo $running | wc -w)" -lt "$JOBS" ] &&
-		{ [ "$(free_mb)" -ge 4096 ] || { [ -z "$running" ] && [ "$(free_mb)" -ge 2048 ]; }; }; do
+	[ -z "$STOP" ] || exit "$STOP"
+	now=$(date +%s)
+	# A count starts with 2 GB free, beside others with 4 GB free, and a
+	# minute after the one before: free memory says little about a count
+	# that has just started. A slow one starts only when no other count
+	# is left or running.
+	if [ -n "$pending" ] && [ "$(echo $running | wc -w)" -lt "$JOBS" ] &&
+		{ [ -z "$running" ] || [ $((now - started)) -ge 60 ]; } &&
+		{ [ "$(free_mb)" -ge 4096 ] || { [ -z "$running" ] && [ "$(free_mb)" -ge 2048 ]; }; }; then
 		w=$(first "$pending")
-		pending=$(rest "$pending")
-		# word splitting intended: the line is a list of words
-		set -- $(workload_line "$w")
-		{
-			rc=0
-			before=$(ooms)
-			count "$w" "$@" >"$LOGS/$w.log" 2>&1 || rc=$?
-			# stopped for memory: here or in a count running beside it,
-			# whichever the kernel picked; this one failed, so it was here
-			[ "$rc" = 0 ] || [ "$(ooms)" = "$before" ] || : >"$LOGS/$w.memory"
-			echo "$rc" >"$LOGS/$w.status"
-		} &
-		COUNTING="${COUNTING:+$COUNTING }$!"
-		running="${running:+$running }$w:$!"
-		note "count of $w: started"
-	done
-	if [ -n "$pending" ] && [ -z "$running" ] && [ -z "$waited" ]; then
-		waited=1
-		note "waiting for 2 GB of memory to be free before the next count"
+		case " $slow " in
+		*" $w "*) [ -z "$fast" ] && go=1 || go= ;;
+		*) go=1 ;;
+		esac
+		if [ -n "$go" ]; then
+			pending=$(rest "$pending")
+			# word splitting intended: the line is a list of words
+			set -- $(workload_line "$w")
+			{
+				rc=0
+				before=$(ooms)
+				count "$w" "$@" >"$LOGS/$w.log" 2>&1 || rc=$?
+				# stopped for memory: here or in a count running beside it,
+				# whichever the kernel picked; this one failed, so maybe here
+				[ "$rc" = 0 ] || [ "$(ooms)" = "$before" ] || : >"$LOGS/$w.memory"
+				echo "$rc" >"$LOGS/$w.status"
+			} &
+			COUNTING="${COUNTING:+$COUNTING }$!"
+			running="${running:+$running }$w:$!"
+			started=$now
+			waited=
+			note "count of $w: started"
+			[ -z "$STOP" ] || exit "$STOP"
+		fi
+	fi
+	if [ -n "$pending" ] && [ -z "$running" ]; then
+		# nothing runs that could free memory: something else holds it
+		if [ -z "$waited" ]; then
+			waited=$now
+			note "waiting for 2 GB of memory to be free before the next count"
+		elif [ $((now - waited)) -ge 600 ]; then
+			note "less than 2 GB of memory was free for 10 minutes; stopping"
+			exit 1
+		fi
 	fi
 	sleep 2
-	# Below 1 GB free, the newest count is stopped: the machine must not
-	# run out (see the header).
-	if [ -n "$running" ] && [ "$(free_mb)" -lt 1024 ]; then
-		job=${running##* }
-		w=${job%:*}
-		case " $stopped " in
-		*" $w "*) ;;
-		*)
-			stopped="$stopped $w"
-			note "count of $w: stopping it, less than 1 GB of memory is left"
-			: >"$LOGS/$w.memory"
-			# what the job's subshell started, not the subshell: it
-			# still writes the failed status
-			for c in $(pgrep -P "${job##*:}"); do
-				kill_tree "$c"
-			done
-			;;
-		esac
-	fi
 	still=
 	for job in $running; do
 		w=${job%:*}
 		pid=${job##*:}
 		if [ ! -f "$LOGS/$w.status" ]; then
-			still="${still:+$still }$job"
-			continue
+			if kill -0 "$pid" 2>/dev/null; then
+				still="${still:+$still }$job"
+				continue
+			fi
+			# its subshell was killed before it could write the status
+			echo "gone" >"$LOGS/$w.status"
 		fi
-		wait "$pid" || true
+		wait "$pid" 2>/dev/null || true
 		COUNTING=$(drop "$pid" "$COUNTING")
 		if [ "$(cat "$LOGS/$w.status")" = 0 ]; then
 			note "count of $w: $(tail -n 1 "$LOGS/$w.log" | sed 's/^record count: //')"
-			left=$(drop "$w" "$left")
 		else
 			note "count of $w: failed:"
 			tail -n 5 "$LOGS/$w.log" | sed 's/^/    /' >&2
 			if [ -e "$LOGS/$w.memory" ]; then
-				note "it was stopped for lack of memory; rerun it with fewer counts at once (-j 1), or on a machine with more memory"
+				note "memory ran out while it ran (the kernel or measure stopped a count); rerun it alone:"
+				echo "" >&2
+				echo "$CMD_COUNT1 count $w" >&2
+				echo "" >&2
 			fi
-			failed="${failed:+$failed }$w"
-			left=$(drop "$w" "$left")
+			failed_count="${failed_count:+$failed_count }$w"
 		fi
+		left_count=$(drop "$w" "$left_count")
+		fast=$(drop "$w" "$fast")
 	done
 	running=$still
+	# Below 1 GB free, the newest count not yet stopped is stopped: the
+	# machine must not run out (see the header).
+	if [ -n "$running" ] && [ "$(free_mb)" -lt 1024 ]; then
+		victim=
+		for job in $running; do
+			case " $stopped " in
+			*" ${job%:*} "*) ;;
+			*) victim=$job ;;
+			esac
+		done
+		if [ -n "$victim" ]; then
+			w=${victim%:*}
+			stopped="$stopped $w"
+			note "count of $w: stopping it, less than 1 GB of memory is left"
+			: >"$LOGS/$w.memory"
+			stop_count "${victim##*:}"
+		fi
+	fi
 done
 rm -rf "$SCRATCH"
-if [ -n "$LOGS" ] && [ -z "$failed" ]; then
+if [ -n "$LOGS" ] && [ -z "$failed_count" ]; then
 	rm -rf "$LOGS"
 	LOGS=
 fi
-[ -n "$failed" ] || note "recorded every workload ($total)"
+[ -n "$failed_time$failed_count$skipped$pending" ] || note "recorded every workload ($total)"

@@ -9,13 +9,13 @@ that spread across programs and machines.
 Install the tools. On Ubuntu:
 
 ```sh
-sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib cmake ninja-build linux-tools-common linux-tools-$(uname -r)
+sudo apt install build-essential m4 git curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib cmake ninja-build linux-tools-common linux-tools-$(uname -r)
 ```
 
 On Debian or Raspberry Pi OS:
 
 ```sh
-sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib cmake ninja-build linux-perf
+sudo apt install build-essential m4 git curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib cmake ninja-build linux-perf
 ```
 
 Name your machine (letters, digits, _; the same name every time):
@@ -40,9 +40,16 @@ hours on a Raspberry Pi. First come the time runs of every workload,
 then one count of each (callgrind, several at a time; on a Raspberry
 Pi this part takes the better part of a day). Wi-Fi and Bluetooth are
 off during the time runs: over ssh on Wi-Fi, run it inside `screen`.
-If it stops early, it prints a command that runs the workloads it did
-not finish.
+If it stops early, it prints the commands that do what is left.
 Results go to `measurements/<workload>/`.
+
+The four slowest counts (gcc and clang building git and Neovim, hours
+each) come last: you can stop `measure` then (Ctrl-C) and keep
+everything else. To leave them out from the start:
+
+```sh
+sudo scripts/measure -n "$nick" -s all
+```
 
 ## After a git pull
 
@@ -53,7 +60,7 @@ description), mark them as up to date instead (`-c`: only those you
 have built):
 
 ```sh
-touch -c build/cc1 build/clang build/git
+touch -c build/cc1 build/clang build/git build/neovim-deps/done
 ```
 
 ## Cleaner measurements

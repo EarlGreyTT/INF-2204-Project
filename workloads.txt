@@ -4,8 +4,8 @@
 # What scripts/measure measures, one workload per line: a name (letters,
 # digits, _ . -), then -q if the program prints its result (its output
 # is then thrown away), -p <program> if the command only starts the
-# measured program (time runs only, no count), and -c <cycles> for a
-# sampling period of its own (it wins over measure's -c), then the
+# measured program, -c <cycles> for a sampling period of its own (it
+# wins over measure's -c), and -s for a slow count (see below), then the
 # command, with paths from the repo folder. Words are split at spaces
 # and quotes are not understood; extra spaces only line the columns up.
 # record keeps each name to one command, so a changed command needs a
@@ -38,13 +38,18 @@ clone-lua            -p build/git                  scripts/workloads/clone lua
 clone-sqlite         -p build/git                  scripts/workloads/clone sqlite
 clone-curl           -p build/git                  scripts/workloads/clone curl
 clone-neovim         -p build/git                  scripts/workloads/clone neovim
-gcc-git              -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc git
 gcc-lua              -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc lua
 gcc-sqlite           -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc sqlite
 gcc-curl             -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc curl
-gcc-neovim           -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc neovim
-clang-git            -q -p build/clang -c 1000003  scripts/workloads/compile clang git
 clang-lua            -q -p build/clang -c 1000003  scripts/workloads/compile clang lua
 clang-sqlite         -q -p build/clang -c 1000003  scripts/workloads/compile clang sqlite
 clang-curl           -q -p build/clang -c 1000003  scripts/workloads/compile clang curl
-clang-neovim         -q -p build/clang -c 1000003  scripts/workloads/compile clang neovim
+
+# The slow counts (-s): each takes hours under callgrind (5 to 8 hours on
+# a 32-core machine, ten counts at once), so measure starts them only
+# when all other counts have ended, in this order (shortest first), and
+# measure -s leaves them out.
+clang-neovim         -s -q -p build/clang -c 1000003  scripts/workloads/compile clang neovim
+gcc-neovim           -s -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc neovim
+gcc-git              -s -q -p build/cc1 -c 1000003    scripts/workloads/compile gcc git
+clang-git            -s -q -p build/clang -c 1000003  scripts/workloads/compile clang git

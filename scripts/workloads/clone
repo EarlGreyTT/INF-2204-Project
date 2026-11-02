@@ -74,6 +74,14 @@ SRC=$BUILD/clones/$1.git
 [ -x "$BUILD/git" ] || die_cmd "$BUILD/git is missing" "make -C $REPO git"
 
 TMP=/tmp/inf2204.$(id -u)
+# /tmp is everyone's: the folder must be this user's own, or another
+# user could put a repository in it to be cloned
+mkdir -m 700 -p "$TMP"
+[ -O "$TMP" ] && [ ! -L "$TMP" ] || die "$TMP is not your own folder; remove it, as its owner"
+trap 'rm -rf "$TMP/$1.clone"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$TMP/$1.exec"
 ln -sf "$BUILD/git" "$TMP/$1.exec/git"
 # Copied once per workload, so the first run takes longer and its noise
