@@ -11,13 +11,12 @@
 # record keeps each name to one command, so a changed command needs a
 # new name.
 #
-# The compile workloads and SQLite's speedtest sample every 1,000,003
-# cycles, not every 100,003: a gcc build of git, or the speedtest at
-# size 1000, runs for minutes, and the default would write 100-200 MB of
-# samples per run.
+# The compile workloads sample every 1,000,003 cycles, not every
+# 100,003: a gcc build of git runs for minutes, and the default would
+# write about 200 MB of samples per run.
 
 # name               options                       command
-sqlite-speedtest-1000 -c 1000003                   build/speedtest1 --testset main --singlethread --size 1000 :memory:
+sqlite-speedtest-500                               build/speedtest1 --testset main --singlethread --size 500 :memory:
 git-log-p            -q                            build/git -C build/repo log -p
 imagemagick-resize   -q                            build/magick build/bridge.ppm -resize 50% -unsharp 0x1 ppm:-
 imagemagick-resize-deer -q                         build/magick build/deer.ppm -resize 50% -unsharp 0x1 ppm:-
