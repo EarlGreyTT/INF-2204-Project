@@ -10,15 +10,27 @@ function's instructions
 Usage:
   rank time <level> <perf-data> <program-name>
   rank count <level> <callgrind-output> <valgrind-log>
+  rank count <level> <sum>
+  rank collect <folder> <program> <sum>
   rank time -a <function> [-b <binary>] <perf-data> <program-name>
   rank count -a <function> [-b <binary>] <callgrind-output> <valgrind-log>
+  rank count -a <function> [-b <binary>] <sum>
 
   time      the samples in <perf-data> (perf record's output) of the
             process named <program-name>
   count     the executions in <callgrind-output> (recorded with
             --dump-instr=yes --skip-plt=no --collect-jumps=yes);
             <valgrind-log> is the same run's log from valgrind -v -v -v,
-            for the load addresses
+            for the load addresses; or a <sum> that collect wrote
+  collect   sum the counts of every process that ran <program>, for a
+            command that starts it many times (record count -p): reads
+            callgrind.<pid>.out and valgrind.<pid>.log in <folder>
+            (callgrind with --trace-children=yes) as each process ends,
+            removes them, and stops once a file named "finished"
+            appears there; writes <sum> (gzipped text). Processes of
+            other programs are left out; one of another file with the
+            program's name is an error. A process that becomes another
+            program (exec) keeps only that program's counts.
   <level>   instructions, lines or functions
   -a        instead of the ranking: <function>'s disassembly, each
             instruction with its samples or count
@@ -71,14 +83,18 @@ checks a time run's binary by its build-id; a count run stores none,
 so there -a only checks that the counts fall on instruction starts.
 """
 import bisect
+import contextlib
 import csv
 import getopt
+import gzip
+import io
 import os
 import re
 import shlex
 import signal
 import subprocess
 import sys
+import time
 from collections import Counter
 
 
@@ -304,6 +320,13 @@ def recorded_ids(data):
 
 # -- count (callgrind) --
 
+# lines of callgrind's output, compiled once: decode reads millions
+OB = re.compile(r"(c?)ob=(?:\((\d+)\))? ?(.*)")
+FILE = re.compile(r"(c?)f([lie])=(?:\((\d+)\))? ?(.*)")
+CALLS = re.compile(r"calls=(\d+) (.*)")
+JUMP = re.compile(r"(?:jump=(\d+)|jcnd=(\d+)/\d+) (.*)")
+
+
 def decode(path):
     """Returns ({(file id, line or 0, object path, address): Ir},
     {(that key of the jumping instruction, target address): jumps},
@@ -356,9 +379,10 @@ def decode(path):
         if fileob.setdefault(id, o) != o:
             die(f"{path}: source file ({id}) is in two objects, {fileob[id]} and {o}")
 
-    with open(path) as f:
-        lines = f.readlines()
-    for l in lines:
+    # line by line: a file can be tens of MB, and collect may hold a
+    # large sum already
+    f = open(path)
+    for l in f:
         if l[0] in "0123456789+-*":
             if pos is None or ir_col is None:
                 die(f"{path}: cost line before the positions:/events: header")
@@ -379,7 +403,7 @@ def decode(path):
                 if switch:
                     file, switch = switch, None
                 cost[at(pos, file)] += int(tok[col])
-        elif m := re.match(r"(c?)ob=(?:\((\d+)\))? ?(.*)", l.rstrip("\n")):
+        elif m := OB.match(l.rstrip("\n")):
             callee, id, name = m.groups()
             if name:
                 names[id] = name
@@ -388,7 +412,7 @@ def decode(path):
                 switch = None
             else:
                 ob = name or names[id]
-        elif m := re.match(r"(c?)f([lie])=(?:\((\d+)\))? ?(.*)", l.rstrip("\n")):
+        elif m := FILE.match(l.rstrip("\n")):
             callee, kind, id, name = m.groups()
             id = id or name
             if callee:
@@ -404,12 +428,12 @@ def decode(path):
             file, switch = fnfile, None
         elif l.startswith("cfn="):
             switch = None
-        elif m := re.match(r"calls=(\d+) (.*)", l):
+        elif m := CALLS.match(l):
             if pos is None:
                 die(f"{path}: call before the positions: header")
             call = (cob or ob, moved(pos, m[2].split())[instr], int(m[1]))
             skip = True
-        elif m := re.match(r"(?:jump=(\d+)|jcnd=(\d+)/\d+) (.*)", l):
+        elif m := JUMP.match(l):
             # jcnd=<taken>/<executed>: the rest went on to the next instruction
             if pos is None:
                 die(f"{path}: jump before the positions: header")
@@ -428,6 +452,7 @@ def decode(path):
             ir_col = events.index("Ir")
         elif l.startswith(("summary:", "totals:")):
             total = int(l.split()[1 + ir_col])
+    f.close()
     if pos is None:
         die(f"{path}: no instruction addresses; record with --dump-instr=yes")
     if total != sum(cost.values()):
@@ -462,15 +487,22 @@ def load_offsets(log):
     return offsets
 
 
+_lines = {}
+
+
 def source_lines(path, addresses):
     """{address: source line, or 0 for none} by the file's debug
     information. Callgrind's line numbers come from the same information
-    and are the same numbers."""
-    addresses = sorted(addresses)
-    out = run("addr2line", "-e", path, input="".join(f"{a:#x}\n" for a in addresses))
-    # "file:line", "file:line (discriminator n)", "??:0", "file:?"
-    return {a: int(m[1]) if (m := re.search(r":(\d+)(?: \(.*\))?$", l)) else 0
-            for a, l in zip(addresses, out.splitlines())}
+    and are the same numbers. Kept, for collect's many processes of one
+    program."""
+    known = _lines.setdefault(path, {})
+    new = sorted(set(addresses) - known.keys())
+    if new:
+        out = run("addr2line", "-e", path, input="".join(f"{a:#x}\n" for a in new))
+        # "file:line", "file:line (discriminator n)", "??:0", "file:?"
+        known.update({a: int(m[1]) if (m := re.search(r":(\d+)(?: \(.*\))?$", l)) else 0
+                      for a, l in zip(new, out.splitlines())})
+    return {a: known[a] for a in addresses}
 
 
 def count_addresses(out, log):
@@ -672,8 +704,8 @@ def instructions(path):
     return _instructions[path]
 
 
-def rank_count(out, log):
-    counts, _, _, total, skipped = count_addresses(out, log)
+def rank_count(data):
+    counts, _, _, total, skipped = data
     loc = Counter()
     for (ob, a), n in counts.items():
         func, off = "[unknown]", a
@@ -685,12 +717,12 @@ def rank_count(out, log):
     return loc
 
 
-def rank_count_source(out, log, level):
+def rank_count_source(data, level):
     """{row: times run} for lines or functions."""
-    counts, arcs, calls, total, skipped = count_addresses(out, log)
+    counts, arcs, calls, total, skipped = data
     if arcs is None:
-        die(f"{out}: no jumps recorded, which lines and functions need; record "
-            f"count again (record now runs callgrind with --collect-jumps=yes)")
+        die("no jumps recorded, which lines and functions need; record "
+            "count again (record now runs callgrind with --collect-jumps=yes)")
     objects, left = {}, 0
     for (ob, a), n in counts.items():
         if ob and os.path.exists(ob):
@@ -1098,15 +1130,223 @@ def read_symbols(path):
             for i, s in enumerate(starts)]
 
 
+_sections = {}
+
+
 def code_sections(path):
     """(name, start, end) of each executable section."""
-    out = []
-    for l in run("objdump", "-h", "-w", path).splitlines():
-        f = l.split()
-        if len(f) > 6 and f[0].isdigit() and "CODE" in l:
-            start = int(f[3], 16)
-            out.append((f[1], start, start + int(f[2], 16)))
-    return out
+    if path not in _sections:
+        out = []
+        for l in run("objdump", "-h", "-w", path).splitlines():
+            f = l.split()
+            if len(f) > 6 and f[0].isdigit() and "CODE" in l:
+                start = int(f[3], 16)
+                out.append((f[1], start, start + int(f[2], 16)))
+        _sections[path] = out
+    return _sections[path]
+
+
+# -- sums of many processes (collect) --
+
+SUM_HEADER = "rank count sum 1"
+
+
+def count_data(files):
+    """count_addresses for a callgrind output and its valgrind log, or
+    the same read from a sum file."""
+    return read_sum(files[0])[0] if len(files) == 1 else count_addresses(*files)
+
+
+def write_sum(path, program, processes, data):
+    """Writes the sum, gzipped text, through a temporary file."""
+    counts, arcs, inside, total, skipped = data
+    obs = sorted({k[0] for k in counts} | {k[0] for k in arcs} | {k[0] for k in inside},
+                 key=lambda o: o or "")
+    ids = {ob: str(i) if ob else "-" for i, ob in enumerate(obs)}
+    with gzip.open(path + ".part", "wt") as f:
+        f.write(f"{SUM_HEADER}\nprogram {program}\nprocesses {processes}\n"
+                f"total {total}\nskipped {skipped}\n")
+        for ob in obs:
+            if ob:
+                f.write(f"o {ids[ob]} {ob}\n")
+        for (ob, a), n in counts.items():
+            f.write(f"c {ids[ob]} {a:x} {n}\n")
+        for (ob, a, t), n in arcs.items():
+            f.write(f"j {ids[ob]} {a:x} {t:x} {n}\n")
+        for (ob, a, t), n in inside.items():
+            f.write(f"i {ids[ob]} {a:x} {t:x} {n}\n")
+    os.replace(path + ".part", path)
+
+
+def read_sum(path):
+    """((counts, jumps, calls inside one object, total Ir, valgrind's
+    own Ir), program, processes) from a sum file."""
+    try:
+        f = gzip.open(path, "rt")
+        if f.readline().rstrip("\n") != SUM_HEADER:
+            raise OSError
+    except OSError:
+        die(f"{path}: not a sum written by rank collect")
+    obs, info = {"-": None}, {}
+    counts, arcs, inside = Counter(), Counter(), Counter()
+    with f:
+        for l in f:
+            k, _, rest = l.rstrip("\n").partition(" ")
+            if k == "c":
+                ob, a, n = rest.split()
+                counts[(obs[ob], int(a, 16))] += int(n)
+            elif k in "ji":
+                ob, a, t, n = rest.split()
+                (arcs if k == "j" else inside)[(obs[ob], int(a, 16), int(t, 16))] += int(n)
+            elif k == "o":
+                i, _, ob = rest.partition(" ")
+                obs[i] = ob
+            else:
+                info[k] = rest
+    return ((counts, arcs, inside, int(info["total"]), int(info["skipped"])),
+            info["program"], int(info["processes"]))
+
+
+def log_info(log):
+    """(program, parent's pid, the lines on loaded files) from a valgrind
+    -v log. valgrind writes the program with its full path, on the
+    Command line, also for a child that a fork made without starting
+    another program; such a child's log has no lines on loaded files: it
+    has its parent's."""
+    exe = ppid = None
+    loads = []
+    with open(log) as f:
+        for l in f:
+            if exe is None and (m := re.match(r"==\d+== Command: (.*)$", l)):
+                # the first word; valgrind writes a space in a word as "\ "
+                exe = re.match(r"((?:\\.|[^ \\])*)", m[1])[1]
+                exe = re.sub(r"\\(.)", r"\1", exe)
+            elif ppid is None and (m := re.match(r"==\d+== Parent PID: (\d+)", l)):
+                ppid = m[1]
+            elif "Reading syms from " in l or "svma " in l:
+                loads.append(l)
+    return exe, ppid, loads
+
+
+def ended(out, log):
+    """Whether the process wrote its counts: callgrind writes totals:
+    last, valgrind its I refs line after that."""
+    try:
+        with open(out, "rb") as f:
+            f.seek(max(0, os.path.getsize(out) - 200))
+            if b"\ntotals: " not in f.read():
+                return False
+        with open(log, "rb") as f:
+            f.seek(max(0, os.path.getsize(log) - 2000))
+            return b"I   refs:" in f.read()
+    except FileNotFoundError:
+        return False
+
+
+def collect(folder, program):
+    """Sums the counts of the processes that ran program, from callgrind
+    outputs and valgrind logs named callgrind.<pid>.out and
+    valgrind.<pid>.log in folder, as the processes end; removes each
+    pair once read. Stops after the file "finished" appears in folder.
+    Returns (data, processes)."""
+    prog = os.path.realpath(program)
+    base = os.path.basename(prog)
+    counts, arcs, inside = Counter(), Counter(), Counter()
+    total = skipped = summed = 0
+    others, notes = Counter(), {}
+    # pid -> (parent's pid, lines on loaded files), also of processes
+    # whose files are gone, for the children a fork made
+    known = {}
+
+    def loads_of(pid, seen=()):
+        """The lines on loaded files that apply to a process: its own, or
+        its parent's (a fork without another program)."""
+        if pid not in known:
+            log = os.path.join(folder, f"valgrind.{pid}.log")
+            if not os.path.exists(log):
+                return None
+            _, ppid, loads = log_info(log)
+            known[pid] = (ppid, loads)
+        ppid, loads = known[pid]
+        if loads:
+            return loads
+        if ppid and ppid not in seen:
+            return loads_of(ppid, seen + (pid,))
+        return None
+
+    while True:
+        # looked at before the files, so that a last look follows it
+        last = os.path.exists(os.path.join(folder, "finished"))
+        for name in sorted(os.listdir(folder)):
+            if not (m := re.fullmatch(r"valgrind\.(\d+)\.log", name)):
+                continue
+            pid = m[1]
+            log = os.path.join(folder, name)
+            out = os.path.join(folder, f"callgrind.{pid}.out")
+            exe, ppid, own = log_info(log)
+            known[pid] = (ppid, own)
+            if not ended(out, log):
+                if not last:
+                    continue
+                # A process that became a program valgrind does not
+                # follow (exec) leaves a log and no counts.
+                if os.path.exists(out) or (exe and os.path.realpath(exe) == prog):
+                    die(f"process {pid} ({exe}) did not end normally: no complete counts "
+                        f"in {out}")
+                os.remove(log)
+                continue
+            if not exe:
+                die(f"{log}: no program named; run valgrind with -v -v -v")
+            if os.path.realpath(exe) == prog:
+                read = log
+                if not own:
+                    # a fork's child: its parent's loaded files, then its log
+                    loads = loads_of(pid)
+                    if not loads:
+                        die(f"process {pid} ({exe}): no lines on loaded files in its log "
+                            f"or its parent's ({ppid}); run valgrind with -v -v -v")
+                    read = log + ".loads"
+                    with open(read, "w") as f, open(log) as g:
+                        f.writelines(loads)
+                        f.write(g.read())
+                err = io.StringIO()
+                try:
+                    with contextlib.redirect_stderr(err):
+                        c, a, i, t, sk = count_addresses(out, read)
+                except SystemExit as e:
+                    die(f"process {pid}: {str(e.code).removeprefix('rank: error: ')}")
+                finally:
+                    if read != log:
+                        os.remove(read)
+                if a is None:
+                    die(f"{out}: no jumps recorded; run callgrind with --collect-jumps=yes")
+                counts.update(c)
+                arcs.update(a)
+                inside.update(i)
+                total, skipped, summed = total + t, skipped + sk, summed + 1
+                # each kind of message once, with how many processes had it
+                for l in err.getvalue().splitlines():
+                    kind = re.sub(r"[0-9][0-9,.]*", "N", l)
+                    notes.setdefault(kind, [l, 0])[1] += 1
+            elif os.path.basename(exe) == base:
+                die(f"process {pid} ran {exe}, not {prog}, so its counts would be mixed "
+                    f"with the program's. Make the command start {prog} itself (for git: "
+                    f"--exec-path; for gcc: -B).")
+            else:
+                others[os.path.basename(exe)] += 1
+            os.remove(out)
+            os.remove(log)
+        if last:
+            break
+        time.sleep(2)
+    if not summed:
+        die(f"no process ran {prog}")
+    for l, n in notes.values():
+        print(l if n == 1 else f"{l} (the first of {n} processes like it)", file=sys.stderr)
+    n = sum(others.values())
+    print(f"processes: {summed} of {base}, summed; {n} other{'' if n == 1 else 's'} left out"
+          + "".join(f", {n} {name}" for name, n in sorted(others.items())), file=sys.stderr)
+    return (counts, arcs, inside, total, skipped), summed
 
 
 # -- one function (-a) --
@@ -1131,18 +1371,21 @@ def time_objects(data, comm, binary):
     return objs, stale
 
 
-def count_objects(out, log, binary):
+def count_objects(files, binary):
     """[(recorded path, file to read, Counter(address))]."""
-    counts, _, _, _, _ = count_addresses(out, log)
+    counts, _, _, _, _ = count_data(files)
     addrs = {}
     for (ob, a), n in counts.items():
         if ob:
             addrs.setdefault(ob, Counter())[a] += n
     if binary:
-        with open(out) as f:
-            cmd = next((l.split()[1] for l in f if l.startswith("cmd:")), None)
+        if len(files) == 1:
+            cmd = read_sum(files[0])[1]
+        else:
+            with open(files[0]) as f:
+                cmd = next((l.split()[1] for l in f if l.startswith("cmd:")), None)
         if cmd not in addrs:
-            die(f"{out}: no counts for the program ({cmd})")
+            die(f"{files[0]}: no counts for the program ({cmd})")
         return [(cmd, binary, addrs[cmd])], []
     return [(ob, ob, a) for ob, a in addrs.items() if os.path.exists(ob)], []
 
@@ -1197,6 +1440,13 @@ def usage(status=1):
 def main(argv):
     if any(a in ("-h", "--help") for a in argv[:2]):
         usage(0)
+    if argv[:1] == ["collect"]:
+        if len(argv) != 4:
+            usage()
+        folder, program, path = argv[1:]
+        data, processes = collect(folder, program)
+        write_sum(path, os.path.realpath(program), processes, data)
+        return
     if not argv or argv[0] not in ("time", "count"):
         usage()
     try:
@@ -1205,24 +1455,26 @@ def main(argv):
         usage()
     opts = dict(opts)
     mode, func, binary = argv[0], opts.get("-a"), opts.get("-b")
+    # count takes a callgrind output and its log, or a sum
+    files = 1 if mode == "count" and len(args) == (1 if func else 2) else 2
     if func:
-        if len(args) != 2:
+        if len(args) != files:
             usage()
-        a, b = args
         q = shlex.quote
-        fix = f"{q(sys.argv[0])} {mode} -a {q(func)} -b <binary> {q(a)} {q(b)}"
+        fix = f"{q(sys.argv[0])} {mode} -a {q(func)} -b <binary> " + " ".join(map(q, args))
         if mode == "time":
-            show_function(func, *time_objects(a, b, binary), "samples", fix)
+            show_function(func, *time_objects(*args, binary), "samples", fix)
         else:
-            show_function(func, *count_objects(a, b, binary), "Ir", fix)
+            show_function(func, *count_objects(args, binary), "Ir", fix)
         return
-    if len(args) != 3 or args[0] not in LEVELS or binary:
+    if len(args) != 1 + files or args[0] not in LEVELS or binary:
         usage()
-    level, a, b = args
-    if level == "instructions":
-        loc = rank_time(a, b) if mode == "time" else rank_count(a, b)
+    level, a, b = args[0], args[1], args[2:]
+    if mode == "time":
+        loc = rank_time(a, b[0]) if level == "instructions" else rank_time_source(a, b[0], level)
     else:
-        loc = (rank_time_source if mode == "time" else rank_count_source)(a, b, level)
+        data = count_data([a] + b)
+        loc = rank_count(data) if level == "instructions" else rank_count_source(data, level)
     if not loc:
         die(f"nothing to rank in {a}")
     out = csv.writer(sys.stdout, lineterminator="\n")

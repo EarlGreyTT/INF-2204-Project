@@ -7,25 +7,51 @@
 # workloads in workloads.txt
 #
 # Usage:
-#   measure -n <nick> [-r <runs>] [-u] [-c <cycles>] [-m <dir>] all
 #   measure -n <nick> [-r <runs>] [-u] [-c <cycles>] [-m <dir>]
-#           <workload>...
+#           [-j <counts>] all
+#   measure -n <nick> [-r <runs>] [-u] [-c <cycles>] [-m <dir>]
+#           [-j <counts>] <workload>...
 #
-#   all          build the programs, download their inputs (440 MB the
-#                first time), then run record all (time runs, then a
-#                count) on every workload in workloads.txt, in order; as
-#                root
+#   all          build the programs, download their inputs (about
+#                1.5 GB the first time), then record every workload in
+#                workloads.txt: first the time runs of each, in order
+#                (record all -t: a warm-up run, then the time runs, on
+#                the tuned system), then one count of each, several at
+#                a time, untuned (counts are exact; callgrind is slow);
+#                as root
 #   <workload>   the same for only these workloads
 #
 #   -n <nick>    your machine's short name, e.g. t14; the same every time
+#   -j <counts>  how many counts run at most at once (default 3, at most
+#                the number of CPUs minus one); each takes about 1.5
+#                CPUs and up to a few GB of memory, so another starts
+#                only while 4 GB are free
 #   -r, -u, -c and -m are record's: see scripts/record -h
 #
+# Counts must not take all the memory: a Raspberry Pi with 8 GB hung for
+# five minutes and restarted, with two compiler counts on top of its
+# other services. So measure stops the newest count whenever less than
+# 1 GB is free (it fails, and measure says so). Where the kernel allows
+# it, the counts also run in one systemd slice, inf2204counts.slice,
+# capped at what was free when they began minus 1 GB, with no swap; the
+# kernel then stops one of them at once. Raspberry Pi OS cannot cap
+# (cgroup_disable=memory in cmdline.txt): there they run one at a time.
+#
 # The build runs as the user who ran sudo; record runs from the repo's
-# folder. A workload that fails does not stop the others; Ctrl-C stops
+# folder. It also builds the programs given with -p in build/ (the
+# compilers, for the compile workloads), only if one of the chosen
+# workloads needs them: that takes hours on a Raspberry Pi. A workload that fails does not stop the others; Ctrl-C stops
 # them all. If any failed or did not run, the end prints the command
 # that runs just those. Such a rerun records a workload again in full:
 # its good runs from before stay, so it can end up with more runs than
 # the others.
+#
+# The counts' output goes to a log per workload, under /tmp; the
+# terminal gets one line when each starts and ends.
+#
+# Workloads may keep files in /tmp/inf2204.<user id> (RAM on most
+# machines; the clone workloads do); measure empties it before and
+# after each workload's time runs, and before and after the counts.
 
 set -eu
 # no globbing: workloads.txt's lines are split into words, and a word
@@ -115,6 +141,29 @@ rest() {
 	esac
 }
 
+# free_mb: the memory available for new programs, in MB
+free_mb() {
+	awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo
+}
+
+# kill_tree pid: stops a process and everything it started, children
+# first (a count's callgrind runs in a session of its own)
+kill_tree() {
+	for _c in $(pgrep -P "$1"); do
+		kill_tree "$_c"
+	done
+	kill -s TERM "$1" 2>/dev/null || true
+}
+
+# drop word list: the list without that word
+drop() {
+	_out=
+	for _w in $2; do
+		[ "$_w" = "$1" ] || _out="${_out:+$_out }$_w"
+	done
+	echo "$_out"
+}
+
 [ $# -ge 1 ] || usage
 for a in "$@"; do
 	case "$a" in
@@ -125,15 +174,22 @@ done
 NICK=
 RUNS=
 UNTUNED=
+# set before the workloads run; emptied on exit
+SCRATCH=
 PERIOD=
 MDIR=
-while getopts n:r:uc:m: opt; do
+JOBS=
+# the counts running: their subshells' pids, and their logs' folder
+COUNTING=
+LOGS=
+while getopts n:r:uc:m:j: opt; do
 	case "$opt" in
 	n) NICK=$OPTARG ;;
 	r) RUNS=$OPTARG ;;
 	u) UNTUNED=-u ;;
 	c) PERIOD=$OPTARG ;;
 	m) MDIR=$OPTARG ;;
+	j) JOBS=$OPTARG ;;
 	*) usage ;;
 	esac
 done
@@ -151,6 +207,14 @@ case "$RUNS" in
 esac
 case "$PERIOD" in
 *[!0-9]* | 0*) die "-c takes a positive number of cycles, got '$PERIOD'" ;;
+esac
+case "$JOBS" in
+*[!0-9]* | 0*) die "-j takes a positive number of counts, got '$JOBS'" ;;
+"")
+	JOBS=$(($(nproc) - 1))
+	[ "$JOBS" -le 3 ] || JOBS=3
+	[ "$JOBS" -ge 1 ] || JOBS=1
+	;;
 esac
 # measure starts record from the repo's folder (cd below), so a
 # relative folder is made absolute here
@@ -188,7 +252,7 @@ else
 fi
 
 # this command without its workloads, to print with the ones left over
-CMD="sudo $(quote "$0") -n $(quote "$NICK")${RUNS:+ -r $RUNS}${UNTUNED:+ -u}${PERIOD:+ -c $PERIOD}${MDIR:+ -m $(quote "$MDIR")}"
+CMD="sudo $(quote "$0") -n $(quote "$NICK")${RUNS:+ -r $RUNS}${UNTUNED:+ -u}${PERIOD:+ -c $PERIOD}${MDIR:+ -m $(quote "$MDIR")} -j $JOBS"
 
 if [ "$(id -u)" != 0 ]; then
 	die_cmd "must run as root (tuning and perf need it)" "$CMD $*"
@@ -204,10 +268,43 @@ fi
 # make's output goes to a log, the user's to read; only its end is
 # shown if it fails. The user's shell writes it: root may not write to
 # another user's file in /tmp (fs.protected_regular).
+# the programs the chosen workloads give with -p, if make builds them
+# (build/...), e.g. build/cc1; make data does not build them
+progs=
+for w in $todo; do
+	for p in $(workload_line "$w" | awk '{
+		for (i = 1; i <= NF; ) {
+			if ($i == "-p") { print $(i + 1); exit }
+			else if ($i == "-c") i += 2
+			else if ($i ~ /^-/) i++
+			else exit
+		} }'); do
+		case "$p" in
+		build/*)
+			case " $progs " in
+			*" $p "*) ;;
+			*) progs="${progs:+$progs }$p" ;;
+			esac
+			;;
+		esac
+	done
+done
+what="the programs"
+# word splitting intended: progs is a list of files
+if [ -n "$progs" ] && ! as_user make -C "$REPO" -q $progs >/dev/null 2>&1; then
+	what="the programs, also $progs (can take hours on a Raspberry Pi),"
+fi
+
 LOG=$(as_user mktemp)
-note "building the programs and downloading their inputs (make; minutes the first time)"
-if ! as_user sh -c 'exec >"$3" 2>&1; make -C "$1" -j"$2" && make -C "$1" data' sh \
-	"$REPO" "$(nproc)" "$LOG"; then
+note "building $what and downloading their inputs (make; minutes the first time)"
+# word splitting intended: progs is a list of files
+# One program at a time: the compilers' builds each use several CPUs and
+# a lot of memory.
+if ! as_user sh -c 'exec >"$3" 2>&1; repo=$1 jobs=$2; shift 3
+	make -C "$repo" -j"$jobs" all || exit
+	for p; do make -C "$repo" -j"$jobs" "$p" || exit; done
+	make -C "$repo" data' sh \
+	"$REPO" "$(nproc)" "$LOG" $progs; then
 	tail -n 20 "$LOG" >&2
 	die "make failed; all of its output is in $LOG"
 fi
@@ -219,6 +316,16 @@ left=$todo
 # that runs just those.
 on_exit() {
 	status=$?
+	# the counts still running: sudo passes the signal on to record,
+	# which stops its callgrind
+	for pid in $COUNTING; do
+		kill_tree "$pid"
+	done
+	for pid in $COUNTING; do
+		wait "$pid" 2>/dev/null || true
+	done
+	[ -z "$LOGS" ] || note "the counts' logs are in $LOGS"
+	[ -z "${SCRATCH:-}" ] || rm -rf "$SCRATCH"
 	again="$failed${failed:+${left:+ }}$left"
 	[ -n "$again" ] || return 0
 	if [ -n "$left" ]; then
@@ -241,25 +348,176 @@ trap 'exit 141' PIPE
 trap 'exit 143' TERM
 
 cd "$REPO"
+SCRATCH=/tmp/inf2204.${SUDO_UID:-$(id -u)}
 total=$(echo "$todo" | wc -w)
+
+# the time runs, one workload after the other
 i=0
-while [ -n "$left" ]; do
-	w=$(first "$left")
+for w in $todo; do
 	i=$((i + 1))
-	note "workload $i of $total: $w"
+	note "time runs, workload $i of $total: $w"
 	# word splitting intended: the line is a list of words
 	set -- $(workload_line "$w")
+	rm -rf "$SCRATCH"
 	status=0
-	"$SCRIPTS/record" all -n "$NICK" -w "$w" ${RUNS:+-r} ${RUNS:+"$RUNS"} $UNTUNED \
+	"$SCRIPTS/record" all -t -n "$NICK" -w "$w" ${RUNS:+-r} ${RUNS:+"$RUNS"} $UNTUNED \
 		${PERIOD:+-c} ${PERIOD:+"$PERIOD"} ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@" || status=$?
+	rm -rf "$SCRATCH"
 	case "$status" in
-	0) left=$(rest "$left") ;;
+	0) ;;
 	# terminal closed, Ctrl-C, pipe closed, killed: stop the series
 	129 | 130 | 141 | 143) exit "$status" ;;
 	*)
 		failed="${failed:+$failed }$w"
-		left=$(rest "$left")
+		left=$(drop "$w" "$left")
 		;;
 	esac
 done
+
+# count w word...: one count of workload w, its line's words without
+# -c <cycles> (sampling is for time runs), as the user who ran sudo
+count() {
+	w=$1
+	shift
+	n=$#
+	options=1
+	while [ "$n" -gt 0 ]; do
+		a=$1
+		shift
+		n=$((n - 1))
+		if [ "$options" = 1 ]; then
+			case "$a" in
+			-c)
+				shift
+				n=$((n - 1))
+				continue
+				;;
+			-p)
+				# and its program
+				set -- "$@" "$a" "$1"
+				shift
+				n=$((n - 1))
+				continue
+				;;
+			-*) ;;
+			*) options=0 ;;
+			esac
+		fi
+		set -- "$@" "$a"
+	done
+	if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+		set -- sudo -u "$SUDO_USER" -- "$SCRIPTS/record" count -n "$NICK" -w "$w" \
+			${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
+	else
+		set -- "$SCRIPTS/record" count -n "$NICK" -w "$w" ${MDIR:+-m} ${MDIR:+"$MDIR"} "$@"
+	fi
+	# in the capped slice (see the header)
+	systemd-run --scope --quiet --collect --slice=inf2204counts -- "$@"
+}
+
+# ooms: how many times the kernel has stopped a program in the counts'
+# slice for lack of memory
+ooms() {
+	awk '$1 == "oom_kill" { print $2; exit }' /sys/fs/cgroup/inf2204counts.slice/memory.events 2>/dev/null || echo 0
+}
+
+# then the counts, up to JOBS at once
+pending=$left
+if [ -n "$pending" ]; then
+	LOGS=$(mktemp -d /tmp/measure-counts.XXXXXX)
+	chmod 755 "$LOGS"
+	rm -rf "$SCRATCH"
+	cap=$(($(free_mb) - 1024))
+	[ "$cap" -ge 1024 ] ||
+		die "only $(free_mb) MB of memory free; the counts need at least 2 GB free to start"
+	# Raspberry Pi OS boots without memory control (cgroup_disable=memory
+	# in cmdline.txt); systemd then ignores the cap without a word
+	if grep -qw memory /sys/fs/cgroup/cgroup.controllers 2>/dev/null; then
+		systemctl set-property --runtime inf2204counts.slice MemoryMax="${cap}M" MemorySwapMax=0 ||
+			die "could not cap the counts' memory (systemctl set-property inf2204counts.slice)"
+		note "counts: $(echo "$pending" | wc -w), up to $JOBS at a time, untuned, in at most $cap MB of memory; logs in $LOGS"
+	else
+		JOBS=1
+		note "warning: this kernel cannot cap memory (memory is not in /sys/fs/cgroup/cgroup.controllers; on a Raspberry Pi, cgroup_disable=memory in cmdline.txt), so the counts run one at a time"
+		note "counts: $(echo "$pending" | wc -w), one at a time, untuned; logs in $LOGS"
+	fi
+fi
+running=
+stopped=
+waited=
+while [ -n "$pending" ] || [ -n "$running" ]; do
+	# a count starts with 2 GB free, beside others with 4 GB free
+	while [ -n "$pending" ] && [ "$(echo $running | wc -w)" -lt "$JOBS" ] &&
+		{ [ "$(free_mb)" -ge 4096 ] || { [ -z "$running" ] && [ "$(free_mb)" -ge 2048 ]; }; }; do
+		w=$(first "$pending")
+		pending=$(rest "$pending")
+		# word splitting intended: the line is a list of words
+		set -- $(workload_line "$w")
+		{
+			rc=0
+			before=$(ooms)
+			count "$w" "$@" >"$LOGS/$w.log" 2>&1 || rc=$?
+			# stopped for memory: here or in a count running beside it,
+			# whichever the kernel picked; this one failed, so it was here
+			[ "$rc" = 0 ] || [ "$(ooms)" = "$before" ] || : >"$LOGS/$w.memory"
+			echo "$rc" >"$LOGS/$w.status"
+		} &
+		COUNTING="${COUNTING:+$COUNTING }$!"
+		running="${running:+$running }$w:$!"
+		note "count of $w: started"
+	done
+	if [ -n "$pending" ] && [ -z "$running" ] && [ -z "$waited" ]; then
+		waited=1
+		note "waiting for 2 GB of memory to be free before the next count"
+	fi
+	sleep 2
+	# Below 1 GB free, the newest count is stopped: the machine must not
+	# run out (see the header).
+	if [ -n "$running" ] && [ "$(free_mb)" -lt 1024 ]; then
+		job=${running##* }
+		w=${job%:*}
+		case " $stopped " in
+		*" $w "*) ;;
+		*)
+			stopped="$stopped $w"
+			note "count of $w: stopping it, less than 1 GB of memory is left"
+			: >"$LOGS/$w.memory"
+			# what the job's subshell started, not the subshell: it
+			# still writes the failed status
+			for c in $(pgrep -P "${job##*:}"); do
+				kill_tree "$c"
+			done
+			;;
+		esac
+	fi
+	still=
+	for job in $running; do
+		w=${job%:*}
+		pid=${job##*:}
+		if [ ! -f "$LOGS/$w.status" ]; then
+			still="${still:+$still }$job"
+			continue
+		fi
+		wait "$pid" || true
+		COUNTING=$(drop "$pid" "$COUNTING")
+		if [ "$(cat "$LOGS/$w.status")" = 0 ]; then
+			note "count of $w: $(tail -n 1 "$LOGS/$w.log" | sed 's/^record count: //')"
+			left=$(drop "$w" "$left")
+		else
+			note "count of $w: failed:"
+			tail -n 5 "$LOGS/$w.log" | sed 's/^/    /' >&2
+			if [ -e "$LOGS/$w.memory" ]; then
+				note "it was stopped for lack of memory; rerun it with fewer counts at once (-j 1), or on a machine with more memory"
+			fi
+			failed="${failed:+$failed }$w"
+			left=$(drop "$w" "$left")
+		fi
+	done
+	running=$still
+done
+rm -rf "$SCRATCH"
+if [ -n "$LOGS" ] && [ -z "$failed" ]; then
+	rm -rf "$LOGS"
+	LOGS=
+fi
 [ -n "$failed" ] || note "recorded every workload ($total)"

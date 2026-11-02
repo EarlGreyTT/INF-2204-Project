@@ -24,6 +24,16 @@
 #                                   of test photos used in image
 #                                   compression research (the download,
 #                                   346 MB, is of the whole set)
+#                    build/clones/  for the clone workloads: the history
+#                                   of one release each of git, Lua,
+#                                   SQLite, curl and Neovim, as bare
+#                                   repositories (460 MB)
+#                    build/tars/    for zstd and xz: the files of those
+#                                   five releases, one tar each (260 MB)
+#                    build/compile/ and build/lua-*.tar.gz
+#                                   for the compile workloads: the
+#                                   source code they compile (git's is
+#                                   the download "make git" uses)
 #   make clean       remove build/
 #
 # Third-party programs: a pinned release, its download checked against
@@ -141,6 +151,11 @@ MPFR_SHA256 = 9ad62c7dc910303cd384ff8f1f4767a655124980bb6d8650fe62c815a231bb7b
 MPC_VERSION = 1.3.1
 MPC_SHA256 = ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8
 
+# compiled by the compile workloads (lua.org publishes this SHA-256)
+LUA_VERSION = 5.5.1
+LUA_SHA256 = 1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce
+LUA_URL = https://www.lua.org/ftp/lua-$(LUA_VERSION).tar.gz
+
 # no published checksum: this is the SHA-256 of our first download
 # (2026-09-27)
 SILESIA_SHA256 = 0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af
@@ -150,6 +165,40 @@ SILESIA_URL = https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
 # (2026-10-26)
 IMAGES_SHA256 = 16c273504425923259b1ddf8e39dfa9cb27585d249f6263cfc6bea39cfafa660
 IMAGES_URL = https://imagecompression.info/test_images/rgb8bit.zip
+
+# The repositories for the clone workloads: the history up to one
+# release (the commit its tag points to), packed by our git. The pack
+# file's SHA-256 is that of our first build (2026-10-30).
+CLONES = git lua sqlite curl neovim
+# v2.56.0
+CLONE_URL_git = https://github.com/git/git
+CLONE_COMMIT_git = a018953688f1b10bddf91bff8747068f5f4746a4
+CLONE_PACK_SHA256_git = 4fa8b52f40a4f834edbc78d3a5c5becd7b4ffd519aafe9f41e3c6f82aabe09a8
+# v5.5.1
+CLONE_URL_lua = https://github.com/lua/lua
+CLONE_COMMIT_lua = 7579fc9d7ed90240487251dfb69168f8e64e9294
+CLONE_PACK_SHA256_lua = 13e2ea3d21c4c47e1f5fb866b35344dd04240258b37ddfb450b8c494849f83b6
+# version-3.54.0
+CLONE_URL_sqlite = https://github.com/sqlite/sqlite
+CLONE_COMMIT_sqlite = 6932c59ee5c280599dfae9e7b431698a7cab9687
+CLONE_PACK_SHA256_sqlite = d622152796d838f55a94355c0e0b7ce97c337f061cf23ec575f34a9bd129bcbf
+# curl-8_23_0
+CLONE_URL_curl = https://github.com/curl/curl
+CLONE_COMMIT_curl = 3163ec065643ba20709f190111f42c3e1fe95273
+CLONE_PACK_SHA256_curl = c4bdda77ff2ab53c1f49ec693df101deb6de03076e8a0ff2cd6af6016be7eac9
+# v0.12.6
+CLONE_URL_neovim = https://github.com/neovim/neovim
+CLONE_COMMIT_neovim = 779c36969e31080503be2dfccbcc3f999e289606
+CLONE_PACK_SHA256_neovim = 225b33bbd1c11b777352ac9b4f813b4b51c79dd08fbbc4eacfaabbfeda18e8dd
+
+# The same releases' files as one tar each, made by our git from the
+# repositories above (git archive), so the same bytes on every platform;
+# SHA-256 of our first build (2026-11-01, the same on a Pi)
+TAR_SHA256_git = f9fe8e8e154798639bb00f7d50144e8f5b2ca6a5d891e245c4330000197fd5f8
+TAR_SHA256_lua = 4ef7a99521d0d770c5424d2fd2268bd9ba4936690b10068b3b8619b7b97d495f
+TAR_SHA256_sqlite = 20a52c48ccfc5b5c47cd77fe58d6397887732d95fe59631ee5253217e975d77c
+TAR_SHA256_curl = 65a992eebdfe630fcf3f8b946cbac0d0d16c9b647b2f2da0b0c96f9b6c0d9e0d
+TAR_SHA256_neovim = e241cc128c99fb0043f0697cb7c2d8a588b933575c58b7ff9b35f4c18c2d9871
 
 all: quicksort zstd xz sqlite git magick
 
@@ -161,7 +210,9 @@ git: $(BUILD)/git
 magick: $(BUILD)/magick
 clang: $(BUILD)/clang
 gcc: $(BUILD)/cc1
-data: $(BUILD)/silesia $(BUILD)/repo $(BUILD)/bridge.ppm
+data: $(BUILD)/silesia $(BUILD)/repo $(BUILD)/bridge.ppm $(foreach c,$(CLONES),$(BUILD)/clones/$(c).git) \
+	$(foreach c,$(CLONES),$(BUILD)/tars/$(c).tar) $(BUILD)/git-$(GIT_VERSION).tar.gz \
+	$(BUILD)/lua-$(LUA_VERSION).tar.gz $(BUILD)/compile/sqlite
 
 # fetch url sha256: downloads to $@, kept only if the checksum matches
 define fetch
@@ -389,6 +440,59 @@ $(BUILD)/rgb8bit.zip: | $(BUILD)
 # one photo of a common size: 2749 x 4049 pixels (11 megapixels)
 $(BUILD)/bridge.ppm: $(BUILD)/rgb8bit.zip
 	unzip -p $< bridge.ppm > $@.part
+	mv $@.part $@
+
+# Both gits run without the settings of the user or the system
+# (~/.gitconfig, /etc/gitconfig, GIT_* variables): some change the pack
+# or the repository's format. The system's git downloads (ours has no
+# network support), told to leave out what it would add by itself
+# (commit graphs, maintenance), as that differs between versions. Our
+# git then packs everything anew, the way a server keeps its
+# repositories (with a bitmap index), with fixed settings and one
+# thread. -F also compresses every object again, with our zlib:
+# otherwise objects keep the bytes the server sent, which can differ
+# from one download to the next. build/ comes first in PATH, so that the
+# helpers git starts (pack-objects) are ours too, not the system's (our
+# git has no folder of its own for them). So every platform gets the
+# same pack file: how objects are packed changes the work a clone does.
+# Two checks: the release's commit, and the pack file's SHA-256. Our git
+# is only needed to be there (|): a rebuilt git need not download the
+# repositories again; if it packed differently, the check would say so.
+CLONE_FETCH = env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C TZ=UTC GIT_CONFIG_NOSYSTEM=1 git
+CLONE_GIT = env -i PATH=$(abspath $(BUILD)):/usr/bin:/bin HOME=/nonexistent LC_ALL=C TZ=UTC \
+	GIT_CONFIG_NOSYSTEM=1 $(abspath $(BUILD))/git
+$(BUILD)/clones/%.git: | $(BUILD)/git
+	rm -rf $@.part $@
+	mkdir -p $(BUILD)/clones
+	$(CLONE_GIT) init -q --bare --template= -b main $@.part
+	$(CLONE_FETCH) -C $@.part -c gc.auto=0 -c maintenance.auto=false -c fetch.writeCommitGraph=false \
+		fetch -q --no-tags --no-write-fetch-head $(CLONE_URL_$*) $(CLONE_COMMIT_$*):refs/heads/main
+	rm -rf $@.part/objects/info/commit-graph $@.part/objects/info/commit-graphs
+	$(CLONE_GIT) -C $@.part -c pack.threads=1 -c pack.window=10 -c pack.depth=50 \
+		-c repack.writeBitmaps=true repack -q -a -d -F
+	test "$$($(CLONE_GIT) -C $@.part rev-parse main)" = $(CLONE_COMMIT_$*)
+	echo "$(CLONE_PACK_SHA256_$*)  $$(echo $@.part/objects/pack/*.pack)" | sha256sum -c --quiet
+	mv $@.part $@
+
+$(BUILD)/tars/%.tar: $(BUILD)/clones/%.git
+	mkdir -p $(BUILD)/tars
+	$(CLONE_GIT) --git-dir=$< archive --format=tar main > $@.part
+	echo "$(TAR_SHA256_$*)  $@.part" | sha256sum -c --quiet
+	mv $@.part $@
+
+$(BUILD)/lua-$(LUA_VERSION).tar.gz: | $(BUILD)
+	$(call fetch,$(LUA_URL),$(LUA_SHA256))
+
+# For the compile workloads: SQLite as its build compiles the sqlite3
+# program, from two generated files, sqlite3.c (all of SQLite) and
+# shell.c. They are made here, not in a run: making them builds a helper
+# program with the system's compiler. They do not depend on the machine
+# (configure only chose how the helper is built).
+$(BUILD)/compile/sqlite: $(BUILD)/speedtest1
+	rm -rf $@ $@.part
+	$(BUILDENV) $(MAKE) -C $(SQLITE_SRC) shell.c >/dev/null
+	mkdir -p $@.part
+	cp $(SQLITE_SRC)/sqlite3.c $(SQLITE_SRC)/sqlite3.h $(SQLITE_SRC)/shell.c $@.part
 	mv $@.part $@
 
 $(BUILD):

@@ -9,13 +9,13 @@ that spread across programs and machines.
 Install the tools. On Ubuntu:
 
 ```sh
-sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-matplotlib linux-tools-common linux-tools-$(uname -r)
+sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib linux-tools-common linux-tools-$(uname -r)
 ```
 
 On Debian or Raspberry Pi OS:
 
 ```sh
-sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-matplotlib linux-perf
+sudo apt install build-essential curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib linux-perf
 ```
 
 Name your machine (letters, digits, _; the same name every time):
@@ -32,11 +32,29 @@ In this folder, with a laptop on its charger:
 sudo scripts/measure -n "$nick" all
 ```
 
-This builds the programs, downloads their inputs (440 MB) and measures
-each workload in `workloads.txt`. Wi-Fi and Bluetooth are off during
-the time runs: over ssh on Wi-Fi, run it inside `screen`. If it stops
-early, it prints a command that runs the workloads it did not finish.
+This builds the programs, downloads their inputs (1.5 GB; `build/`
+takes about 12 GB of disk) and measures each workload in
+`workloads.txt`. The compile workloads need our own compilers,
+`build/cc1` and `build/clang`: the first run builds them, which takes
+hours on a Raspberry Pi. First come the time runs of every workload,
+then one count of each (callgrind, several at a time; on a Raspberry
+Pi this part takes the better part of a day). Wi-Fi and Bluetooth are
+off during the time runs: over ssh on Wi-Fi, run it inside `screen`.
+If it stops early, it prints a command that runs the workloads it did
+not finish.
 Results go to `measurements/<workload>/`.
+
+## After a git pull
+
+`make` rebuilds a program whenever the Makefile has changed. For
+`build/cc1` and `build/clang` that takes hours on a Raspberry Pi. If
+the change did not touch how they are built (it says so in its
+description), mark them as up to date instead (`-c`: only those you
+have built):
+
+```sh
+touch -c build/cc1 build/clang build/git
+```
 
 ## Cleaner measurements
 
