@@ -4,7 +4,7 @@
 
 """Per-file statistics over every CSV in measurements/*/time/.
 
-Run AFTER merge_counts so the *.avg.csv files exist too. Every .csv in each
+Run AFTER merge_samples so the *.avg.csv files exist too. Every .csv in each
 time directory (run files and averaged files) gets one row in OUTPUT:
 
     workload, filename, average, variance, standard deviation, n_values,
