@@ -89,6 +89,8 @@ sudo scripts/tune reset
 - `tune`: sets the machine up for measuring, and back.
 - `rank`: makes the ranked lists.
 - `graphing <list.csv>`: plots a list in a window.
+- `average_total_samples`: averages samples per instruction of each run into one .csv file. insignificant. 
+- `merge_samples`: loops through a configed directory and averages the samples per instruction for all runs on the same machine, workload, dataset and level of granularity.
 
 All are in `scripts/`. The first four show their help with `-h`.
 
