@@ -1,48 +1,70 @@
 #!/usr/bin/env python3
-# Author: Kathryn Ann Emblow
+# Authors: Kathryn Ann Emblow && Tuva Marie Eaton Johansen
+
+"""
+Graph inputted files as a log-log graph.
+
+run with:
+
+python3 graphing <relative_filepath_a> <relative_filepath_b> 
+
+With any number of input filepaths.
+
+There is no title as there will be a figure description in the paper.
+
+"""
+
 
 import matplotlib.pyplot as plt
 import sys
 import csv
 
+FONTSIZE = 10
 
-def graph(x, y, x_label, y_label, title):
-    plt.loglog(x, y)
-    plt.xlabel(x_label)
-    plt.ylabel(y_label)
-    plt.title(title)
-
-    plt.legend
-    plt.show()
-
-
-def parse_data(header, data, title):
-    y = [float(row[1]) for row in data]
-    x = [x for x in range(1, len(y) + 1)]
-    x_label = header[0]
-    y_label = header[1]
-    graph(x, y, x_label, y_label, title)
-
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman'] + plt.rcParams['font.serif']
 
 def main():
     if len(sys.argv) < 2:
-        print("Error: No input file\nUsage: python3 graphing.py <path> title=None", file=sys.stderr)
+        print("Error: No input file\nUsage: python3 graphing.py <path>", file=sys.stderr)
         return
-    path = sys.argv[1]
 
-    try:
-        with open(path, 'r') as f:
-            data = csv.reader(f)
-            header = next(data)
+    unit = " (" + sys.argv[2].split("/")[-2] + ")"
+    if unit == "count":
+        unit = None
 
-            title = f"{sys.argv[1].split("/")[-1]} {header[1]} per {header[0]}"
-            if len(sys.argv) == 3:
-                title = sys.argv[2].split("=")[1].strip("\"")
+    header = None
+    all_data = []
+    for i in range(2, len(sys.argv)):
+        path = sys.argv[i]
+        try:
+            with open(path, 'r') as f:
+                data = csv.reader(f)
+                if not header:
+                    header = next(data)
+                else:
+                    next(data)
 
-            parse_data(header, data, title)
+                y = [float(row[1]) for row in data]
+                x = [x for x in range(1, len(y) + 1)]
 
-    except FileNotFoundError:
-        print(f"Error: {path} not found", file=sys.stderr)
+                all_data.append(x)
+                all_data.append(y)
+                
+                all_data.append(path.split("/")[-1])
+
+        except FileNotFoundError:
+            print(f"Error: {path} not found, skipping file", file=sys.stderr)
+
+    i = 0
+    while i < len(all_data):
+        plt.loglog(all_data[i], all_data[i+1], label=all_data[i+2])
+        i += 3
+
+    plt.xlabel(header[0])
+    plt.ylabel(header[1] + unit)
+    plt.legend(fontsize=FONTSIZE)
+    plt.show()
 
     
 if __name__ == "__main__":
