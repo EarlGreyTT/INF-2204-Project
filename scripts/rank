@@ -8,39 +8,38 @@ how often they were sampled (perf) or ran (callgrind), or show one
 function's instructions
 
 Usage:
-  rank time <level> <perf-data> <program-name>
+  rank time <level> <perf-data> <program>
+                            rank perf's samples of <program>
   rank count <level> <callgrind-output> <valgrind-log>
-  rank count <level> <sum>
+                            rank callgrind's counts
+  rank count <level> <sum>  rank the counts collect summed
   rank collect [-p <pid> [-g <group>]] <folder> <program> <sum>
-  rank time -a <function> [-b <binary>] <perf-data> <program-name>
-  rank count -a <function> [-b <binary>] <callgrind-output> <valgrind-log>
-  rank count -a <function> [-b <binary>] <sum>
+                            sum the counts of every process of <program>
+  rank time|count -a <function> [-b <binary>] ...
+                            show <function>'s instructions, each with its
+                            samples or count, instead of a ranking
 
-  time      the samples in <perf-data> (perf record's output) of the
-            process named <program-name>
-  count     the executions in <callgrind-output> (recorded with
-            --dump-instr=yes --skip-plt=no --collect-jumps=yes);
-            <valgrind-log> is the same run's log from valgrind -v -v -v,
-            for the load addresses; or a <sum> that collect wrote
-  collect   sum the counts of every process that ran <program>, for a
-            command that starts it many times (record count -p): reads
-            callgrind.<pid>.out[.<n>] and valgrind.<pid>.log in
-            <folder> (callgrind with --trace-children=yes
-            --dump-before=_Fork) as each process ends, removes them,
-            and stops once a file named "finished" appears there;
-            writes <sum> (gzipped text). Processes of other programs
-            are left out; one of another file with the program's name
-            is an error. A process that becomes another program (exec)
-            keeps only that program's counts.
-  -p        collect: stop with an error if process <pid> (the one that
-            started the command) ends before "finished" appears; -g:
-            then stop process group <group> (the command's) too
-  <level>   instructions, lines or functions
-  -a        instead of the ranking: <function>'s disassembly, each
-            instruction with its samples or count
-  -b        disassemble <binary>, a stored copy of the program (e.g.
-            measurements/<workload>/binaries/<hash>), instead of the file
-            at the recorded path, which the next build overwrites
+  <level>       instructions, lines or functions
+  -b <binary>   disassemble this stored copy of the program
+  -p <pid>      collect: stop with an error if <pid> ends first
+  -g <group>    collect, with -p: then stop process group <group> too
+
+time reads perf record's output. count reads a callgrind output
+recorded with --dump-instr=yes --skip-plt=no --collect-jumps=yes, with
+the same run's log from valgrind -v -v -v for the load addresses.
+
+collect is for a command that starts <program> many times (record count
+-p). It reads callgrind.<pid>.out[.<n>] and valgrind.<pid>.log in
+<folder> (callgrind with --trace-children=yes --dump-before=_Fork) as
+each process ends, removes them, and stops once a file named "finished"
+appears there; it writes <sum> (gzipped text). Other programs are left
+out; another file with the program's name is an error. A process that
+becomes another program (exec) keeps only that program's counts; a
+child holding a copy of its parent's counts (posix_spawn, or a vfork
+whose program did not start) is left out.
+
+-b: the recorded path is overwritten by the next build, so -a can read
+a stored copy instead (measurements/<workload>/binaries/<hash>).
 
 Prints CSV, most first, ties ordered by name so the ranks are the same
 every time. file is the program or library the code is in; source is
@@ -465,6 +464,9 @@ def decode(path):
         die(f"{path}: no instruction addresses; record with --dump-instr=yes")
     if total != sum(cost.values()):
         die(f"{path}: decoded {sum(cost.values())} Ir but the file's total is {total}")
+    if min(min((k[3] for k in cost), default=0), min((k[1] for k in jumps), default=0),
+           min((k[2] for k in calls), default=0)) < 0:
+        die(f"{path}: an address below zero; is the file damaged?")
     return cost, jumps, calls, fileob
 
 
@@ -637,7 +639,14 @@ def count_addresses(out, log):
             continue
         own, a = place[key]
         if own and os.path.dirname(own) != tooldir:
-            arcs[(own, a, target + a - key[3])] += n
+            t = target + a - key[3]
+            if t < 0:
+                # moved to its object by the load addresses, it would
+                # leave the object, which no jump does
+                die(f"{out}: a jump from {os.path.basename(own)} {a:#x} goes before the "
+                    f"start of that file: the counts do not fit the log's load addresses "
+                    f"(another program's counts mixed in, or another run's log?)")
+            arcs[(own, a, t)] += n
     if lost:
         die(f"{out}: {lost:,} jumps from instructions with no count")
     count_rep_jumps(counts, arcs)
@@ -800,10 +809,28 @@ def instructions(path):
     return _instructions[path]
 
 
+def gone_objects(counts):
+    """Warns of the objects with counts that are gone since the run (a
+    deleted build): nothing names their code. Returns them."""
+    missing = {ob for ob in {ob for ob, _ in counts} if ob and not os.path.exists(ob)}
+    gone = Counter()
+    if missing:
+        for (ob, _), n in counts.items():
+            if ob in missing:
+                gone[ob] += n
+    if gone:
+        print(f"warning: gone since the run, left out: {sum(gone.values()):,} Ir in "
+              + ", ".join(sorted(gone)), file=sys.stderr)
+    return gone
+
+
 def rank_count(data):
     counts, _, _, total, skipped = data
+    gone = gone_objects(counts)
     loc = Counter()
     for (ob, a), n in counts.items():
+        if ob in gone:
+            continue
         func, off = "[unknown]", a
         if ob and (sym := symbol_at(symbols(ob), a)):
             func, off = sym[2], a - sym[0]
@@ -819,9 +846,12 @@ def rank_count_source(data, level):
     if arcs is None:
         die("no jumps recorded, which lines and functions need; record "
             "count again (record now runs callgrind with --collect-jumps=yes)")
+    gone = gone_objects(counts)
     objects, left = {}, 0
     for (ob, a), n in counts.items():
-        if ob and os.path.exists(ob):
+        if ob in gone:
+            continue
+        if ob:
             objects.setdefault(ob, {})[a] = n
         else:
             left += n
@@ -939,7 +969,8 @@ def flow(ob, exe, jumps, starts):
     on = {}  # address -> times control went on to it from the instruction before
     for a in exe:
         if exe[a] < into[a]:
-            die(f"{ob}: {a:#x} ran {exe[a]:,} times but was jumped to {into[a]:,} times")
+            die(f"{ob}: {a:#x} ran {exe[a]:,} times but was jumped to {into[a]:,} times; "
+                f"are another program's counts mixed in?")
         p = prev.get(a)
         if p in exe and a not in starts:
             # more than can have come from p came from outside (longjmp)
@@ -1475,17 +1506,22 @@ def read_sum(path):
 
 
 def log_info(log, head=False):
-    """(program, parent's pid, the lines on loaded files) from a valgrind
-    -v log; with head, only the first two, read from the log's start.
-    valgrind writes the program with its full path, on the Command line,
-    also for a child that a fork made without starting another program;
-    such a child's log has no lines on the files loaded before the fork:
-    they are in its parent's."""
-    exe = ppid = None
-    loads = []
+    """(program, parent's pid, the lines on loaded files, the whole
+    command, {basic block: how many of those lines came before it} for
+    each time callgrind wrote counts) from a valgrind -v log; with head,
+    only the first two, read from the log's start. valgrind writes the
+    program with its full path, on the Command line, also for a child
+    that a fork made without starting another program; such a child's
+    log has no lines on the files loaded before the fork: they are in
+    its parent's, up to where the parent wrote its counts before the
+    fork. A process that starts a program (exec) starts its log
+    afresh."""
+    exe = ppid = cmd = None
+    loads, dumps = [], {}
     with open(log, errors="surrogateescape") as f:
         for l in f:
             if exe is None and (m := re.match(r"==\d+== Command: (.*)$", l)):
+                cmd = m[1]
                 # the first word; valgrind writes a space in a word as "\ "
                 exe = re.match(r"((?:\\.|[^ \\])*)", m[1])[1]
                 exe = re.sub(r"\\(.)", r"\1", exe)
@@ -1493,9 +1529,34 @@ def log_info(log, head=False):
                 ppid = m[1]
             elif "Reading syms from " in l or "svma " in l:
                 loads.append(l)
+            elif m := re.search(r" Start dumping at BB (\d+) ", l):
+                dumps[int(m[1])] = len(loads)
             if head and exe is not None and ppid is not None:
                 break
-    return exe, ppid, loads
+    return exe, ppid, loads, cmd, dumps
+
+
+def part_program(out):
+    """The program a callgrind output's process ran when it was written:
+    the first word of its cmd: line (callgrind writes the words as they
+    are, so a path with a space is cut), or None."""
+    with open(out, errors="surrogateescape") as f:
+        for _, l in zip(range(20), f):
+            if l.startswith("cmd:"):
+                words = l[4:].split()
+                return words[0] if words else None
+    return None
+
+
+def time_range(out):
+    """(first, last) basic block of a callgrind output's counts, or None
+    for a file still being written. A fork's child starts at the block
+    where its parent wrote its counts before the fork."""
+    with open(out, errors="surrogateescape") as f:
+        for _, l in zip(range(30), f):
+            if m := re.match(r"desc: Timerange: Basic block (\d+) - (\d+)", l):
+                return int(m[1]), int(m[2])
+    return None
 
 
 def started_here(loads):
@@ -1553,29 +1614,54 @@ def collect(folder, program, owner=None, group=None):
     prog = os.path.realpath(program)
     base = os.path.basename(prog)
     counts, arcs, inside = Sum(1), Sum(2), Sum(2)
-    total = skipped = summed = lost = 0
+    total = skipped = summed = lost = dropped = copies = 0
     others, notes = Counter(), {}
-    # pid -> (parent's pid, lines on loaded files) of processes whose log
-    # is gone, for their fork's children
+    # pid -> (command, parent's pid, lines on loaded files, where counts
+    # were written in the log, last blocks of its parts, first block) of
+    # processes of the program, kept for their fork's children once the
+    # files are gone
     known = {}
+    started = {}  # (parent's pid, first block) -> the fork's child that started there
 
-    def loads_of(pid, seen=()):
-        """The lines on loaded files that apply to a process: for a fork's
-        child, its parent's (read fresh while the parent runs) and then
-        its own."""
+    def facts(pid):
         log = os.path.join(folder, f"valgrind.{pid}.log")
         if os.path.exists(log):
-            _, ppid, loads = log_info(log)
-            known[pid] = (ppid, loads)
-        elif pid not in known:
+            _, ppid, loads, cmd, dumps = log_info(log)
+            files = [os.path.join(folder, n) for n in parts(pid)]
+            ends = {r[1] for p in files if (r := time_range(p))}
+            out = os.path.join(folder, f"callgrind.{pid}.out")
+            first = next((r[0] for p in files[:1] + [out] if os.path.exists(p)
+                          and (r := time_range(p))), None)
+            known[pid] = (cmd, ppid, loads, dumps, ends, first)
+        return known.get(pid)
+
+    def inherited(pid, cmd, ppid, start, seen=()):
+        """The lines on loaded files that a fork's child started with:
+        its parent's up to where the parent wrote its counts before the
+        fork (the parent can load and unload files after it), and above
+        them its parent's, for a parent that is a fork's child too. None
+        if the parent wrote no counts there: the child was made without
+        that (posix_spawn, vfork) and holds a copy of the parent's counts
+        since it last wrote them."""
+        p = facts(ppid) if ppid and ppid not in seen else None
+        if p is None:
+            die(f"process {pid} of {base}: no lines on loaded files in its log or its "
+                f"parent's ({ppid}); run valgrind with -v -v -v")
+        pcmd, pppid, loads, dumps, ends, first = p
+        # A parent that started a program (exec) after the fork, even
+        # itself again, has a new log: its files at the fork are gone.
+        if pcmd != cmd or (start not in dumps and start in ends):
+            die(f"process {pid} of {base}: its parent ({ppid}) started a program (exec) "
+                f"after the fork, so the files loaded at the fork are not known")
+        if start not in dumps:
             return None
-        ppid, loads = known[pid]
+        loads = loads[:dumps[start]]
         if started_here(loads):
             return loads
-        if ppid and ppid not in seen:
-            above = loads_of(ppid, seen + (pid,))
-            return above + loads if above else None
-        return None
+        above = inherited(ppid, pcmd, pppid, first, seen + (pid,)) if first is not None else None
+        if above is None:
+            die(f"process {pid} of {base}: no lines on loaded files for its parent ({ppid})")
+        return above + loads
 
     def parts(pid):
         """A process's parts in order, listed afresh: one may have come
@@ -1610,7 +1696,7 @@ def collect(folder, program, owner=None, group=None):
             pid = m[1]
             log = os.path.join(folder, name)
             out = os.path.join(folder, f"callgrind.{pid}.out")
-            exe, ppid, _ = log_info(log, head=True)
+            exe, ppid = log_info(log, head=True)[:2]
             mine = bool(exe) and os.path.realpath(exe) == prog
             if exe and not mine:
                 # another program's parts are of no use: gone at once (a
@@ -1641,22 +1727,46 @@ def collect(folder, program, owner=None, group=None):
                 die(f"{log}: no program named; run valgrind with -v -v -v")
             if mine:
                 read = log
-                _, _, own = log_info(log)
-                known[pid] = (ppid, own)
+                cmd, _, own, _, _, first = facts(pid)
                 if not started_here(own):
                     # a fork's child: its parent's loaded files, then its own
-                    loads = loads_of(pid)
-                    if not loads:
-                        die(f"process {pid} ({exe}): no lines on loaded files in its log "
-                            f"or its parent's ({ppid}); run valgrind with -v -v -v")
+                    if first is None:
+                        die(f"{out}: no Timerange line; is it a callgrind output?")
+                    loads = inherited(pid, cmd, ppid, first)
+                    if loads is None:
+                        copies += 1
+                        remove(pid)
+                        continue
+                    # Two children cannot start at the same place, unless
+                    # one holds a copy, and which one is not known.
+                    if (ppid, first) in started:
+                        die(f"processes {started[(ppid, first)]} and {pid} of {base} start "
+                            f"at the same point of their parent ({ppid}): one holds a copy "
+                            f"of the parent's counts (posix_spawn or vfork, whose program "
+                            f"did not start), and which is not known; count again with "
+                            f"callgrind --dump-before for posix_spawn and vfork too")
+                    started[(ppid, first)] = pid
                     read = log + ".loads"
                     with open(read, "w", errors="surrogateescape") as f, \
                             open(log, errors="surrogateescape") as g:
-                        f.writelines(loads[:len(loads) - len(own)])
+                        f.writelines(loads)
                         f.write(g.read())
+                # A shell that forked (for a `...`) and then became the
+                # program (exec, same pid) left parts with its own counts,
+                # placed by the shell's load addresses: summed with the
+                # program's they gave wrong counts (clang under curl's
+                # make). Kept are the parts of this program only.
+                own_parts = []
+                for n in parts(pid):
+                    part = os.path.join(folder, n)
+                    p = part_program(part)
+                    if p and (p == exe or os.path.realpath(p) == prog):
+                        own_parts.append(part)
+                    else:
+                        dropped += 1
                 err = io.StringIO()
                 try:
-                    for part in [os.path.join(folder, n) for n in parts(pid)] + [out]:
+                    for part in own_parts + [out]:
                         with contextlib.redirect_stderr(err):
                             c, a, i, t, sk = count_addresses(part, read)
                         if a is None:
@@ -1698,6 +1808,13 @@ def collect(folder, program, owner=None, group=None):
         print(f"processes of {base} that ended without counts, not counted: {lost} (a "
               f"fork's child that started a program valgrind does not follow, such as "
               f"clang's linker, or one that was killed)", file=sys.stderr)
+    if copies:
+        print(f"processes of {base} that held a copy of their parent's counts, not "
+              f"counted: {copies} (children of posix_spawn or vfork whose program did "
+              f"not start)", file=sys.stderr)
+    if dropped:
+        print(f"parts written before a process became {base} (exec), by the program it "
+              f"was before (such as a shell), not counted: {dropped}", file=sys.stderr)
     n = sum(others.values())
     print(f"processes: {summed} of {base}, summed; {n} other{'' if n == 1 else 's'} left out"
           + "".join(f", {n} {name}" for name, n in sorted(others.items())), file=sys.stderr)
