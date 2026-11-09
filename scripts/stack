@@ -21,15 +21,16 @@ Usage:
 
 Each <list.csv> is a ranked list from rank (rank,count,...), most first.
 Every list becomes a line of rank against its share of the total, and
-the colour of a spot is how many lists pass there. Each list weighs the
-same in every column of the picture, so a long or steep list does not
-outshine others (a density line chart: Moritz and Fisher, 2018).
+the colour of a spot is how many series pass there. A series is one
+workload's runs on one platform: it counts once, however many runs it
+has. Each weighs the same in every column of the picture, so a long or
+steep list does not outshine others (a density line chart: Moritz and
+Fisher, 2018).
 
 How to read it:
   - Mixing time and count lists stretches the y axis to fit both.
-  - The dashed line is the share of a count of 1. Near it a list can only
-    have 1, 2, 3 ... samples, so many lists sit on the same rows: that is
-    rounding, not agreement.
+  - At the bottom the lines turn into stairs: samples are whole numbers.
+    That is counting, not agreement.
   - Fewer lists reach far ranks, so the right side fades. That alone is
     not disagreement.
 """
@@ -37,6 +38,7 @@ How to read it:
 import argparse
 import csv
 import os
+import re
 import shlex
 import sys
 import warnings
@@ -210,16 +212,20 @@ def main():
     if len(args.lists) >= 50:
         print(f"stack: reading {len(args.lists)} lists", file=sys.stderr)
     lists = [read_list(path) for path in args.lists]
+    # Each workload on each platform counts once, however many runs it
+    # has: <workload>/<time|count>/<platform>.run<N>.<file>
+    def series(path):
+        parts = os.path.abspath(path).split(os.sep)
+        name = re.match(r'(.+)\.run[0-9]+\.', parts[-1])
+        return (parts[-3], name.group(1)) if name and len(parts) >= 3 else path
+    groups = [series(path) for path in args.lists]
+    runs = {g: groups.count(g) for g in set(groups)}
+    weights = [1 / runs[g] for g in groups]
 
-    # the share of a count of 1 (median list): below it the tail is steps
-    totals = np.array([counts.sum() for counts in lists])
-    one = 100 / np.sort(totals)[(len(totals) - 1) // 2]
-    unit = "1 sample" if all('samples' in os.path.basename(p) for p in args.lists) else "a count of 1"
-    one_label = unit if (totals == totals[0]).all() else f"{unit} (median list)"
 
     # at least a decade each way
     longest = max(len(counts) for counts in lists)
-    smallest = min(min(counts.min() / counts.sum() for counts in lists) * 100, one)
+    smallest = min(counts.min() / counts.sum() for counts in lists) * 100
     x_lo, x_hi = 0, max(np.log10(longest) + 0.05, 1)
     y_hi = 2  # 100%
     y_lo = min(np.log10(smallest) - 0.03 * (y_hi - np.log10(smallest)), y_hi - 1)
@@ -230,7 +236,7 @@ def main():
     # Lines, not points, so far-apart points leave no gaps. Each list
     # weighs 1 per column, else steep pieces make vertical streaks.
     lists_through = np.zeros(nx * ny)
-    for counts in lists:
+    for counts, weight in zip(lists, weights):
         rank = np.arange(1, len(counts) + 1)
         x = (np.log10(rank) - x_lo) / (x_hi - x_lo) * nx
         y = (np.log10(counts / counts.sum() * 100) - y_lo) / (y_hi - y_lo) * ny
@@ -242,7 +248,7 @@ def main():
         ys = np.append(y[piece] + t * (y[piece + 1] - y[piece]), y[-1])
         dot = np.unique(np.clip(xs.astype(int), 0, nx - 1) * ny + np.clip(ys.astype(int), 0, ny - 1))
         per_column = np.bincount(dot // ny, minlength=nx)
-        lists_through[dot] += 1 / per_column[dot // ny]
+        lists_through[dot] += weight / per_column[dot // ny]
     lists_through = lists_through.reshape(nx, ny)
     lists_through[lists_through == 0] = np.nan  # empty dots stay blank
 
@@ -254,14 +260,14 @@ def main():
         style = {'font.size': 8, 'pdf.fonttype': 42, 'axes.linewidth': 0.6,
                  'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
                  'xtick.minor.width': 0.4, 'ytick.minor.width': 0.4}
-        size, dpi, line_colour = (3.5, 2.3), 600, '#666666'
-        bar_label = 'lists passing (per column)'
+        size, dpi = (3.5, 2.3), 600
+        bar_label = 'series passing (per column)'
     else:
         cmap = ListedColormap(viridis(np.linspace(0.3, 1, 256)))
         style = 'dark_background'
         # 12.8 x 7.2 inches at 300 dots per inch: a 4K picture, 3840 x 2160
-        size, dpi, line_colour = (12.8, 7.2), 300, '#aaaaaa'
-        bar_label = 'how many lists pass here (per column)'
+        size, dpi = (12.8, 7.2), 300
+        bar_label = 'how many series pass here (per column)'
 
     svg = bool(args.image) and args.image.lower().endswith('.svg')
     if svg:
@@ -269,19 +275,13 @@ def main():
                          'axes.labelcolor': INK, 'axes.edgecolor': INK,
                          'xtick.color': INK, 'ytick.color': INK,
                          'legend.facecolor': 'none'}]
-        line_colour = '#888888'
 
     with plt.style.context(style):
         fig, ax = plt.subplots(figsize=size, layout='constrained')
         # log: dots of few lists and of many both show
-        n = len(lists)
+        n = len(runs)
         mesh = ax.pcolormesh(x_edges, y_edges, lists_through.T, cmap=cmap,
-                             norm=LogNorm(0.1, n), rasterized=True, zorder=2)
-        # under the dots, so it shows only where no list is
-        ax.axhline(one, color=line_colour, linewidth=0.8, linestyle=(0, (4, 3)),
-                   zorder=1, label=one_label)
-        ax.legend(loc='upper right', frameon=False,
-                  fontsize=7 if args.paper else None)
+                             norm=LogNorm(0.1 * min(weights), n), rasterized=True, zorder=2)
         ax.set_xscale('log')
         ax.set_yscale('log')
         ax.set_xlim(x_edges[0], x_edges[-1])
@@ -298,7 +298,8 @@ def main():
         ax.set_xlabel('rank (1 = the most)')
         ax.set_ylabel('share of the total (%)')
         if args.title or not args.paper:
-            ax.set_title(args.title or f"{n} ranked list{'s' if n > 1 else ''} stacked")
+            k = len(lists)
+            ax.set_title(args.title or f"{k} ranked list{'s' if k > 1 else ''} stacked")
 
         bar = fig.colorbar(mesh, label=bar_label, extend='min')
         # 0.1, 1, 10, ... and the number of lists on top; a power of ten

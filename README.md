@@ -9,13 +9,13 @@ that spread across programs and machines.
 Install the tools. On Ubuntu:
 
 ```sh
-sudo apt install build-essential m4 git curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib cmake ninja-build linux-tools-common linux-tools-$(uname -r)
+sudo apt install build-essential m4 git curl rsync unzip xz-utils valgrind python3-matplotlib python3-scipy cmake ninja-build linux-tools-$(uname -r)
 ```
 
 On Debian or Raspberry Pi OS:
 
 ```sh
-sudo apt install build-essential m4 git curl unzip xz-utils valgrind libc6-dbg python3 python3-numpy python3-matplotlib cmake ninja-build linux-perf
+sudo apt install build-essential m4 git curl rsync unzip xz-utils valgrind python3-matplotlib python3-scipy cmake ninja-build linux-perf
 ```
 
 Name your machine (letters, digits, _; the same name every time):
@@ -82,17 +82,30 @@ If a run was killed outright, the machine may still be tuned:
 sudo scripts/tune reset
 ```
 
+## Share
+
+Once, with the ssh destination the server's owner gives you:
+
+```sh
+git config share.remote <destination>
+```
+
+Then `scripts/share upload` sends your measurements; `scripts/share -h`
+shows the rest.
+
 ## Scripts
 
 - `measure`: builds the programs and measures every workload.
 - `record`: measures one program.
 - `tune`: sets the machine up for measuring, and back.
 - `rank`: makes the ranked lists.
+- `share`: uploads and downloads measurements.
+- `stack`: draws many ranked lists in one picture.
 - `graphing <list.csv>`: plots a list in a window.
 - `average_total_samples`: averages samples per instruction of each run into one .csv file. insignificant. 
 - `merge_samples`: loops through a configed directory and averages the samples per instruction for all runs on the same machine, workload, dataset and level of granularity.
 
-All are in `scripts/`. The first four show their help with `-h`.
+All are in `scripts/`. The first six show their help with `-h`.
 
 ---
 
