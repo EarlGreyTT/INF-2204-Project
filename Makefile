@@ -15,9 +15,9 @@
 #   make data        the files the programs are run on:
 #                    build/repo     for git: a repository whose three
 #                                   commits are three releases of git
-#                    build/bridge.ppm, deer.ppm, big_tree.ppm and
-#                    artificial.ppm
-#                                   for ImageMagick: four images from a
+#                    build/bridge.ppm, deer.ppm, big_tree.ppm,
+#                    artificial.ppm and leaves_iso_1600.ppm
+#                                   for ImageMagick: five images from a
 #                                   set of test photos used in image
 #                                   compression research (the download,
 #                                   346 MB, is of the whole set)
@@ -175,8 +175,9 @@ IMAGES_SHA256 = 16c273504425923259b1ddf8e39dfa9cb27585d249f6263cfc6bea39cfafa660
 IMAGES_URL = https://imagecompression.info/test_images/rgb8bit.zip
 # the images taken from it: a portrait 2749 x 4049 (11 megapixels), a
 # landscape 4043 x 2641 (11 megapixels), a large one, 6088 x 4550 (28
-# megapixels), and a computer-made image, 3072 x 2048 (6 megapixels)
-PHOTOS = bridge deer big_tree artificial
+# megapixels), a computer-made image, 3072 x 2048 (6 megapixels), and
+# a noisy high-ISO photo, 3008 x 2000 (6 megapixels)
+PHOTOS = bridge deer big_tree artificial leaves_iso_1600
 
 # The repositories for the clone workloads: the history up to one
 # release (the commit its tag points to), packed by our git. The pack
