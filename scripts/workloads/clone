@@ -86,13 +86,13 @@ mkdir -p "$TMP/$1.exec"
 ln -sf "$BUILD/git" "$TMP/$1.exec/git"
 # Copied once per workload, so the first run takes longer and its noise
 # figures include the copy (cp's samples are not kept). The marker,
-# written only after a whole copy, names the pack, so a rebuilt
-# repository is copied again.
-pack=$(ls "$SRC/objects/pack")
-if [ "$(cat "$TMP/$1.copied" 2>/dev/null)" != "$pack" ]; then
+# written only after a whole copy, lists every file of the repository
+# with its size and time, so a changed repository is copied again.
+files=$(ls -lnR "$SRC")
+if [ "$(cat "$TMP/$1.copied" 2>/dev/null)" != "$files" ]; then
 	rm -rf "$TMP/$1.git"
 	cp -R "$SRC" "$TMP/$1.git"
-	printf '%s\n' "$pack" >"$TMP/$1.copied"
+	printf '%s\n' "$files" >"$TMP/$1.copied"
 fi
 rm -rf "$TMP/$1.clone"
 "$BUILD/git" --exec-path="$TMP/$1.exec" clone -q --no-local --upload-pack="git upload-pack" \

@@ -37,6 +37,9 @@
 #                    build/compile/<compiler>-<program>.tar. Needs the
 #                    compiler (it builds it if missing, so not part of
 #                    "make data") and the downloads of make data.
+#   make valgrind    valgrind with our fix for arm64 (Raspberry Pi), in
+#                    build/valgrind; record uses it when it is there.
+#                    measure builds it on arm64.
 #   make clean       remove build/
 #
 # Third-party programs: a pinned release, its download checked against
@@ -170,6 +173,18 @@ CURL_URL = https://curl.se/download/curl-$(CURL_VERSION).tar.xz
 # the compile workloads with a configure step, and so a prepared tree
 CONFIGURED = curl neovim
 
+# The counts' tool. Its arm64 decoder takes every plain branch for a
+# call, so callgrind's call stack grows without end and long counts run
+# out of memory; patches/valgrind-arm64-b-is-not-a-call.diff fixes that
+# and changes no count. The release Debian 13 and Raspberry Pi OS ship
+# (counts with 3.28.0 were the same). No published checksum: the SHA-256
+# of our first download (2026-11-10)
+VALGRIND_VERSION = 3.24.0
+VALGRIND_SHA256 = 71aee202bdef1ae73898ccf7e9c315134fa7db6c246063afc503aef702ec03bd
+VALGRIND_URL = https://sourceware.org/pub/valgrind/valgrind-$(VALGRIND_VERSION).tar.bz2
+VALGRIND_SRC = $(BUILD)/valgrind-$(VALGRIND_VERSION)
+VALGRIND_PATCH = patches/valgrind-arm64-b-is-not-a-call.diff
+
 # no published checksum: the SHA-256 of our first download (2026-10-26)
 IMAGES_SHA256 = 16c273504425923259b1ddf8e39dfa9cb27585d249f6263cfc6bea39cfafa660
 IMAGES_URL = https://imagecompression.info/test_images/rgb8bit.zip
@@ -222,6 +237,7 @@ git: $(BUILD)/git
 magick: $(BUILD)/magick
 clang: $(BUILD)/clang
 gcc: $(BUILD)/cc1
+valgrind: $(BUILD)/valgrind/bin/valgrind
 data: $(BUILD)/repo $(foreach p,$(PHOTOS),$(BUILD)/$(p).ppm) $(foreach c,$(CLONES),$(BUILD)/clones/$(c).git) \
 	$(foreach c,$(CLONES),$(BUILD)/tars/$(c).tar) $(BUILD)/git-$(GIT_VERSION).tar.gz \
 	$(BUILD)/lua-$(LUA_VERSION).tar.gz $(BUILD)/compile/sqlite $(BUILD)/curl-$(CURL_VERSION).tar.xz \
@@ -557,10 +573,28 @@ $(BUILD)/compile/gcc-%.tar: $(BUILD)/cc1 scripts/workloads/compile Makefile
 $(BUILD)/compile/clang-%.tar: $(BUILD)/clang scripts/workloads/compile Makefile
 	$(BUILDENV) scripts/workloads/compile --prepare clang $*
 
+$(BUILD)/valgrind-$(VALGRIND_VERSION).tar.bz2: | $(BUILD)
+	$(call fetch,$(VALGRIND_URL),$(VALGRIND_SHA256))
+
+# With valgrind's own flags, not ours: it measures, it is not measured.
+# It finds its files by the folder it is installed in, so moving this
+# folder needs a rebuild (make clean). Installed into a staging folder
+# first and moved in whole, so a failed install leaves no build/valgrind
+# that looks finished.
+$(BUILD)/valgrind/bin/valgrind: $(BUILD)/valgrind-$(VALGRIND_VERSION).tar.bz2 $(VALGRIND_PATCH) Makefile
+	rm -rf $(VALGRIND_SRC) $(BUILD)/valgrind $(BUILD)/valgrind-staging
+	tar -xjf $< -C $(BUILD)
+	patch -d $(VALGRIND_SRC) -p1 --quiet <$(VALGRIND_PATCH)
+	cd $(VALGRIND_SRC) && $(BUILDENV) ./configure --quiet --prefix=$(CURDIR)/$(BUILD)/valgrind
+	$(BUILDENV) $(MAKE) -C $(VALGRIND_SRC)
+	$(BUILDENV) $(MAKE) -C $(VALGRIND_SRC) install DESTDIR=$(CURDIR)/$(BUILD)/valgrind-staging >/dev/null
+	mv $(BUILD)/valgrind-staging$(CURDIR)/$(BUILD)/valgrind $(BUILD)/valgrind
+	rm -rf $(BUILD)/valgrind-staging
+
 $(BUILD):
 	mkdir -p $@
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all zstd xz sqlite git magick clang gcc data check-inputs compile-gcc compile-clang clean
+.PHONY: all zstd xz sqlite git magick clang gcc valgrind data check-inputs compile-gcc compile-clang clean

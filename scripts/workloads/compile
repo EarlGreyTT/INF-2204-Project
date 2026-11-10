@@ -14,8 +14,8 @@
 #   <program>    git, lua, sqlite, curl or neovim: the source code make
 #                data keeps in build/
 #   --prepare    for curl and neovim: run their configure step (cmake
-#                for Neovim) and keep the result
-#                in build/compile/<compiler>-<program>.tar (make
+#                for Neovim) and keep the result in
+#                build/compile/<compiler>-<program>.tar (make
 #                compile-gcc and make compile-clang do this)
 #
 # Run it through record, which keeps only the processes of the compiler:
@@ -29,13 +29,15 @@
 # rm -rf.
 #
 # curl and Neovim have a configure step (Neovim's is cmake), which runs
-# the compiler many times
-# on test programs; it is no part of what we measure. --prepare runs it
-# once, in the folder the runs build in (configure writes that absolute
-# path into the Makefiles), and keeps the configured tree with its
-# files' times; a run unpacks it there, and make does not configure
-# again. Both use the same compiler and flags, from this script. The
-# folder has the user's id in it: prepare as the user who runs measure.
+# the compiler many times on test programs; it is no part of what we
+# measure. --prepare runs it once, in the folder the runs build in
+# (configure writes that absolute path into the Makefiles), and keeps
+# the configured tree with its files' times; a run unpacks it there, and
+# make does not configure again. Both use the same compiler and flags,
+# from this script. The folder has the user's id in it: prepare as the
+# user who runs measure. A run stops if the folder, the compiler, the
+# flags or the version of gcc or cmake differ from the prepare's (after
+# a system update, say): make cannot see those.
 #
 # The flags are each program's own, plus ours: the hardening some
 # distributions' compilers add by themselves off, and the run folder
@@ -47,6 +49,9 @@
 # clang is ours alone (--no-default-config: no settings files).
 
 set -eu
+# the PATH record gives the runs, also for --prepare: configure and cmake
+# keep the tools they find by their full paths
+export PATH=/usr/bin:/bin
 
 NAME=compile
 REPO=$(dirname "$(dirname "$(dirname "$(readlink -f "$0")")")")
@@ -77,6 +82,17 @@ usage_block() {
 # makefile_var name: the value of name in the Makefile, e.g. GIT_VERSION
 makefile_var() {
 	sed -n "s/^$1 = //p" "$REPO/Makefile"
+}
+
+# what a prepared tree was made with, in .prepared-for; a run checks it.
+# The system's gcc, also for clang: clang links with gcc's start files
+# and libraries. Neither command starts a compiler.
+prepared_for() {
+	echo "folder: $DIR"
+	echo "compiler: $CC"
+	echo "flags: $FLAGS"
+	echo "gcc: $(gcc -dumpfullversion 2>/dev/null || echo none)"
+	[ "$1" != neovim ] || echo "cmake: $(cmake --version 2>/dev/null | head -n 1)"
 }
 
 PREPARE=
@@ -150,8 +166,13 @@ TMP=/tmp/inf2204.$(id -u)
 mkdir -m 700 -p "$TMP"
 [ -O "$TMP" ] && [ ! -L "$TMP" ] || die "$TMP is not your own folder; remove it, as its owner"
 rm -rf "$DIR"
-# a stopped or failed build leaves nothing in /tmp (RAM on most machines)
-trap 'cd / && rm -rf "$DIR"' EXIT
+# a stopped or failed build leaves nothing in /tmp (RAM on most
+# machines), a stopped prepare no half-written tar
+if [ -n "$PREPARE" ]; then
+	trap 'cd / && rm -rf "$DIR" "$configured.part"' EXIT
+else
+	trap 'cd / && rm -rf "$DIR"' EXIT
+fi
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -182,8 +203,7 @@ if [ -n "$PREPARE" ]; then
 			-DCACHE_PRG=OFF >/dev/null
 		;;
 	esac
-	# the folder it was made for, which a run checks
-	printf '%s\n' "$DIR" >.prepared-for
+	prepared_for "$2" >.prepared-for
 	mkdir -p "$BUILD/compile"
 	tar -cf "$configured.part" .
 	mv "$configured.part" "$configured"
@@ -194,8 +214,8 @@ fi
 
 if [ -n "$configured" ]; then
 	tar -xf "$configured"
-	[ "$(cat .prepared-for)" = "$DIR" ] ||
-		die_cmd "$configured was made for $(cat .prepared-for), not $DIR (another user?)" \
+	prepared_for "$2" | diff .prepared-for - >&2 ||
+		die_cmd "$configured was made with other settings (above: < then, > now; another user, or a system update?)" \
 			"rm $configured; make -C $REPO compile-$1"
 fi
 

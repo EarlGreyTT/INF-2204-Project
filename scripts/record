@@ -13,6 +13,7 @@
 #               [-p <program>] <program> [<arg>...]
 #   record count -n <nick> -w <workload> [-q] [-m <dir>] [-p <program>]
 #                <program> [<arg>...]
+#   record platform -n <nick> [-m <dir>]
 #
 #   all          tune the system, run the command once unrecorded (a
 #                warm-up: the program and its input in memory), record
@@ -24,6 +25,9 @@
 #   count        count exactly how many times each instruction, source
 #                line and function runs, with callgrind; needs no root
 #                or tuning
+#   platform     print the name of this system's platform in the
+#                measurements folder (e.g. t14-2; see below), or
+#                nothing if no run has created it yet
 #
 #   -n <nick>    a nickname for the system measured on (hardware and
 #                software), e.g. t14
@@ -33,8 +37,8 @@
 #                runs go in. Runs of another command need another name.
 #   -r <runs>    how many time runs to record (default 1)
 #   -u           untuned baseline: skip tune, run the program anywhere
-#   -c <cycles>  sampling period for perf (default 100003); fewer samples
-#                disturb the program less
+#   -c <cycles>  sampling period for perf (default 100003); a larger
+#                period gives fewer samples, which disturb the program less
 #   -q           throw away what the program prints to standard output
 #                (normally its first 100 lines are kept in meta.txt);
 #                for a program that prints its result, like xz -c
@@ -53,9 +57,9 @@
 # that, as the user who ran sudo: counts do not depend on tuning, and
 # callgrind is slow. While the system is tuned the radios are off; tune
 # turns them back on after an hour whatever happens, and a time run
-# during which they came back fails. If a series of runs takes longer
-# than that hour, all restores the system and tunes it again before the
-# next run.
+# during which they came back fails. So when a series of runs takes
+# longer than that hour, all restores the system and tunes it again
+# before a run that would not end within it.
 #
 # The program runs with the same small environment in every run (see
 # ENVIRONMENT below), whoever runs it: the environment's size shifts the
@@ -113,7 +117,7 @@
 # Time: one sample every <cycles> cycles (cycles:P: the most precise
 # sampling the CPU supports); a prime period avoids falling into step
 # with loops. Only processes with the program's name are kept, and they
-# must all run the program's very file. perf runs outside tune.slice
+# must all run the program's own file, not a copy. perf runs outside tune.slice
 # and only the program inside it, keeping perf's own work off the
 # measured CPU. That relies on systemd-run --scope moving itself into
 # the slice before exec'ing the program, so a sample on any other CPU
@@ -124,6 +128,11 @@
 # is left out; callgrind sees user space only.
 
 set -eu
+
+# numbers with a decimal point, whatever the locale: mawk (Raspberry Pi
+# OS's awk) prints 12,3 under a Norwegian one. The program gets its own
+# environment (ENVIRONMENT), so this does not change what is measured.
+export LC_ALL=C
 
 NAME=record
 # the program's environment; no existing home folder, so that no user's
@@ -165,6 +174,15 @@ PERF_RAM=
 # a -p count's callgrind process group and collector, while they run
 VG_GROUP=
 COLLECTOR=
+# a count's callgrind, and rank, while they run
+VG_PID=
+RANK_PID=
+# a count's out-of-memory kills in record's cgroup before the program
+# started (see oom_kills)
+OOM_BEFORE=
+# when the run started, and the repo's commit then (for meta.txt)
+START_DATE=
+START_COMMIT=
 
 # records an error in the run being written, if there is one
 record_error() {
@@ -179,9 +197,10 @@ die() {
 	exit 1
 }
 
-# The radios tune turned off that are on again. tune's timer turns them
-# back on after a while, so that a machine reached over Wi-Fi cannot
-# stay cut off; a run with them on is noisier than the others.
+# The radios and WireGuard links tune turned off that are on again.
+# tune's timer turns them back on after a while, so that a machine
+# reached over Wi-Fi or WireGuard cannot stay cut off; a run with them
+# on is noisier than the others.
 radios_back() {
 	[ -f /run/tune.state ] || return 0
 	(
@@ -190,6 +209,14 @@ radios_back() {
 			f=/sys/class/rfkill/rfkill$id/soft
 			if [ -r "$f" ] && [ "$(cat "$f")" = 0 ]; then
 				echo "$id"
+			fi
+		done
+		# each as kind:link:id
+		for k in ${wireguard:-}; do
+			l=${k#*:}
+			l=${l%%:*}
+			if ip -o link show dev "$l" 2>/dev/null | grep -q '[<,]UP[,>]'; then
+				echo "$l"
 			fi
 		done
 	)
@@ -383,7 +410,8 @@ take_command() {
 # as_program untuned runner command...: runs "runner" with the command
 # wrapped the way the program runs in time runs: as the user who ran sudo
 # (what a user may do can change what a program does), with the same
-# small environment, and in tune.slice unless untuned (1). The warm-up
+# small environment and every signal at its default action (see
+# check_signals), and in tune.slice unless untuned (1). The warm-up
 # run and the time runs share it, so the warm-up warms what the runs use
 # (scripts/workloads/clone's copy is in /tmp/inf2204.<user id>).
 as_program() {
@@ -394,7 +422,7 @@ as_program() {
 	fi
 	# word splitting intended: ENVIRONMENT is a list of settings. Inside
 	# systemd-run, which adds a variable of its own.
-	set -- env -i $ENVIRONMENT "$@"
+	set -- env --default-signal env -i $ENVIRONMENT "$@"
 	[ "$_untuned" = 1 ] || set -- systemd-run --scope --slice=tune --quiet "$@"
 	"$_runner" "$@"
 }
@@ -423,17 +451,49 @@ mkdir_own() {
 	own "$top"
 }
 
+# stop_children signal: sends it to what record started and still
+# runs: a -p count's command (its own session: Ctrl-C does not reach
+# it) and collector, a count's callgrind, rank
+stop_children() {
+	[ -z "$VG_GROUP" ] || kill -s "$1" -- "-$VG_GROUP" 2>/dev/null || true
+	[ -z "$VG_PID" ] || kill -s "$1" "$VG_PID" 2>/dev/null || true
+	if [ -n "$COLLECTOR" ]; then
+		# rank collect, then the subshell that waits for it
+		pkill --signal "$1" -P "$COLLECTOR" 2>/dev/null || true
+		kill -s "$1" "$COLLECTOR" 2>/dev/null || true
+	fi
+	[ -z "$RANK_PID" ] || kill -s "$1" "$RANK_PID" 2>/dev/null || true
+}
+
+# wait_gone pid: waits until record's child pid has ended, also when a
+# signal interrupts the wait
+wait_gone() {
+	while kill -0 "$1" 2>/dev/null; do
+		_w=0
+		wait "$1" 2>/dev/null || _w=$?
+		# 127: not record's child (an ended one's pid, taken again)
+		[ "$_w" != 127 ] || break
+	done
+}
+
 # Note why an unfinished run stopped, and hand its files to the user.
 on_exit() {
 	status=$?
-	# a -p count's callgrind (its own session: Ctrl-C does not reach it)
-	# and collector
-	[ -z "$VG_GROUP" ] || kill -s TERM -- "-$VG_GROUP" 2>/dev/null || true
-	if [ -n "$COLLECTOR" ]; then
-		# rank, then the subshell that waits for it
-		pkill -TERM -P "$COLLECTOR" 2>/dev/null || true
-		kill -s TERM "$COLLECTOR" 2>/dev/null || true
-	fi
+	# Nothing may cut this short; a second signal (Ctrl-C again, a second
+	# TERM from measure) only kills what still runs at once.
+	trap '' PIPE
+	trap 'stop_children KILL' HUP INT TERM
+	# A single count's callgrind gets KILL: on TERM it writes its counts
+	# first, which for a large program takes long and much memory, and
+	# the run is thrown away. A -p count's command gets TERM: the
+	# workload scripts then remove what they keep in /tmp (RAM).
+	[ -z "$VG_PID" ] || kill -s KILL "$VG_PID" 2>/dev/null || true
+	stop_children TERM
+	# waited for, so that the memory is free and the files are whole
+	# when record ends
+	for _p in $VG_PID $VG_GROUP $COLLECTOR $RANK_PID; do
+		wait_gone "$_p"
+	done
 	if [ -n "$PERF_RAM" ]; then
 		if [ -f "$PERF_RAM/perf.data" ] && [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
 			mv "$PERF_RAM/perf.data" "$STAGE/perf.data" || true
@@ -487,6 +547,7 @@ platform() {
 	echo "cmdline:   $(cat /proc/cmdline)"
 	echo "libc:      $(ldd --version 2>&1 | head -1)"
 	echo "perf:      $(perf --version 2>/dev/null || echo none)"
+	# the system's; a count's meta.txt names the valgrind it used
 	echo "valgrind:  $(valgrind --version 2>/dev/null || echo none)"
 }
 
@@ -511,6 +572,37 @@ last_number() {
 	echo "$last"
 }
 
+# find_platform root nick description: the name of the platform file
+# with that description, or nothing
+find_platform() {
+	for f in "$1/platforms/$2"-*.txt; do
+		[ -f "$f" ] || continue
+		if [ "$(cat "$f")" = "$3" ]; then
+			basename "$f" .txt
+			return 0
+		fi
+	done
+}
+
+# check_signals: stops if signals are blocked. A program inherits the
+# signals ignored and blocked by whatever started it (& ignores INT and
+# QUIT, nohup HUP, a systemd service PIPE), and some programs run more or
+# less code then: xz, gcc and ImageMagick ask about each signal and set
+# up a handler only for those not ignored (91 instructions each in xz).
+# So the program is started through env --default-signal, which undoes
+# the ignored ones, then env -i: Ubuntu's env (uutils) adds
+# RUST_SIGPIPE=default to the environment with --default-signal, which
+# changes what the program runs (315 instructions in xz), and env -i
+# removes it. env cannot unblock signals. dash unblocks all when it
+# starts; bash does not. The mask is read by sed, a child, as the
+# program would get it: bash's own mask has signals blocked for moments.
+check_signals() {
+	blocked=$(sed -n 's/^SigBlk:[[:space:]]*//p' /proc/self/status)
+	case "$blocked" in
+	*[!0]* | "") die "signals are blocked (SigBlk $blocked), and the program would inherit them; start record from a terminal or a plain script" ;;
+	esac
+}
+
 # start_run root kind nick: finds or creates the platform, stores PROG's
 # binary, picks the run number and creates the staging folder. An empty
 # root means measurements/ in the repo. Sets PLATFORM, RUN, RUN_DIR,
@@ -518,6 +610,7 @@ last_number() {
 start_run() {
 	ROOT=${1:-$SCRIPTS/../measurements}
 	check_command "$ROOT"
+	check_signals
 	for d in "$ROOT/platforms" "$ROOT/$WORKLOAD/binaries" "$ROOT/$WORKLOAD/$2/failed"; do
 		mkdir_own "$d"
 	done
@@ -527,19 +620,22 @@ start_run() {
 	trap 'exit 130' INT
 	trap 'exit 141' PIPE
 	trap 'exit 143' TERM
+	START_DATE=$(date -Iseconds)
+	START_COMMIT=$(repo_commit)
 
+	# One record at a time from here to its staging folder: the platform
+	# and the run number are picked from what exists, and mkdir is no lock
+	# (Ubuntu 26.04's mkdir, from uutils, is not atomic). Released before
+	# the program starts, so nothing measured holds it.
+	lock
 	current=$(platform)
-	for f in "$ROOT/platforms/$3"-*.txt; do
-		[ -f "$f" ] || continue
-		if [ "$(cat "$f")" = "$current" ]; then
-			PLATFORM=$(basename "$f" .txt)
-			break
-		fi
-	done
+	PLATFORM=$(find_platform "$ROOT" "$3" "$current")
 	if [ -z "$PLATFORM" ]; then
 		last=$(last_number "$ROOT/platforms" "$3-" .txt)
 		PLATFORM=$3-$((last + 1))
-		printf '%s\n' "$current" >"$ROOT/platforms/$PLATFORM.txt"
+		# under a dot name until whole (see the binary below)
+		printf '%s\n' "$current" >"$ROOT/platforms/.$PLATFORM.txt.$$"
+		mv "$ROOT/platforms/.$PLATFORM.txt.$$" "$ROOT/platforms/$PLATFORM.txt"
 		own "$ROOT/platforms/$PLATFORM.txt"
 		if [ "$last" -gt 0 ]; then
 			note "new platform $PLATFORM; changed since $3-$last:"
@@ -552,29 +648,77 @@ start_run() {
 	PROG_SHA=$(sha256sum "$PROG" | cut -d' ' -f1)
 	BINARY=$ROOT/$WORKLOAD/binaries/$(printf '%s' "$PROG_SHA" | cut -c1-12)
 	if [ ! -e "$BINARY" ]; then
-		cp "$PROG" "$BINARY"
+		# under a dot name until whole: share upload skips dot names, and
+		# a half copy (a crash, an upload meanwhile) must not look done;
+		# the server keeps the first copy it gets for good
+		cp "$PROG" "$(dirname "$BINARY")/.$(basename "$BINARY").$$"
+		mv "$(dirname "$BINARY")/.$(basename "$BINARY").$$" "$BINARY"
 		own "$BINARY"
 	elif ! cmp -s "$PROG" "$BINARY"; then
 		die "$BINARY exists but differs from $PROG"
 	fi
 
 	RUN_DIR=$ROOT/$WORKLOAD/$2
-	a=$(last_number "$RUN_DIR" "$PLATFORM.run" .meta.txt)
+	# another record's finished run may have emptied failed/ meanwhile
+	mkdir_own "$RUN_DIR/failed"
+	# failed/ first: a run that ends meanwhile moves its meta.txt out
+	# before its folder goes, so it is seen in one place or the other
 	b=$(last_number "$RUN_DIR/failed" "$PLATFORM.run" "")
+	a=$(last_number "$RUN_DIR" "$PLATFORM.run" .meta.txt)
 	if [ "$b" -gt "$a" ]; then
 		a=$b
 	fi
 	RUN=$PLATFORM.run$((a + 1))
 	mkdir "$RUN_DIR/failed/$RUN" || die "could not create $RUN_DIR/failed/$RUN"
 	STAGE=$RUN_DIR/failed/$RUN
+	own "$STAGE"
+	unlock
+}
+
+# lock, unlock: one record at a time in this measurements folder (see
+# start_run); the lock is on the platforms/ folder, which every record
+# can read
+lock() {
+	have flock || die_cmd "flock is not installed" "$(install_hint util-linux util-linux util-linux)"
+	exec 9<"$ROOT/platforms"
+	flock 9
+}
+unlock() {
+	exec 9<&-
+}
+
+# check_unchanged: stops if the program's file is no longer the binary
+# stored when the run started. rank names the counts from the file at
+# the program's path, so a rebuild during the run (make) would name them
+# after the new binary, mostly without an error. Checked before rank
+# (the clear message) and after it (rank reads the file too).
+check_unchanged() {
+	[ "$(sha256sum <"$PROG" | cut -d' ' -f1)" = "$PROG_SHA" ] ||
+		die "$PROG changed during the run (rebuilt?), so its results cannot be named; run it again"
 }
 
 # program_failed status [what]: stops with the program's exit status and
 # the end of what it printed to stderr
 program_failed() {
-	die "${2:-the program} exited with status $1:
+	die "${2:-the program} exited with status $1$(memory_note):
 $(tail -n 5 "$STAGE/program.err" | sed 's/^/    /')
 (everything is in $STAGE)"
+}
+
+# oom_kills: how many processes the kernel has stopped for lack of
+# memory in record's own cgroup (for measure's counts: the count's
+# scope, under a memory cap)
+oom_kills() {
+	_cg=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)
+	awk '$1 == "oom_kill" { n = $2 } END { print n + 0 }' "/sys/fs/cgroup$_cg/memory.events" 2>/dev/null || echo 0
+}
+
+# memory_note: during a count, if the kernel has stopped one of its
+# processes for lack of memory since it started, says so (measure looks
+# for "for lack of memory")
+memory_note() {
+	[ -n "$OOM_BEFORE" ] && [ "$(oom_kills)" != "$OOM_BEFORE" ] || return 0
+	printf '%s' "; the kernel stopped one of its processes for lack of memory"
 }
 
 # noise_report cpu before after: what happened on the CPU between two
@@ -686,8 +830,8 @@ repo_commit() {
 meta_common() {
 	echo "run:           $RUN"
 	echo "workload:      $WORKLOAD"
-	echo "date:          $(date -Iseconds)"
-	echo "repo commit:   $(repo_commit)"
+	echo "date:          $START_DATE"
+	echo "repo commit:   $START_COMMIT"
 	echo "platform:      $PLATFORM (see platforms/$PLATFORM.txt)"
 	# printf: echo would turn a \t in an argument into a tab
 	if [ -n "$STARTER" ]; then
@@ -700,11 +844,12 @@ meta_common() {
 	printf 'arguments:     %s\n' "$*"
 	[ -z "$STARTER" ] || printf 'started by:    %s\n' "$STARTER"
 	echo "binary:        sha256 $PROG_SHA, stored as binaries/$(basename "$BINARY")"
-	echo "compiler:      $(readelf -p .comment "$PROG" 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | head -1)"
+	echo "compiler:      $(readelf -p .comment "$BINARY" 2>/dev/null | sed -n 's/^ *\[ *[0-9a-f]*\] *//p' | head -1)"
 	# from the debug information of the program's first source file: the
 	# options in force, a distribution's own defaults among them
-	echo "compiled with: $(readelf --debug-dump=info "$PROG" 2>/dev/null | sed -n '/DW_AT_producer/ { s/.*): //p; q; }')"
+	echo "compiled with: $(readelf --debug-dump=info "$BINARY" 2>/dev/null | sed -n '/DW_AT_producer/ { s/.*): //p; q; }')"
 	echo "environment:   $ENVIRONMENT"
+	echo "signals:       reset to their default actions; none blocked"
 	echo "user:          $(id -un "$RUN_UID" 2>/dev/null || echo "$RUN_UID")"
 	echo "aslr:          $(cat /proc/sys/kernel/randomize_va_space) (randomize_va_space; 2: full)"
 	echo "page size:     $(getconf PAGESIZE) bytes"
@@ -732,16 +877,28 @@ meta_output() {
 rank_run() {
 	_mode=$1 _what=$2
 	shift 2
-	"$SCRIPTS/rank" "$_mode" instructions "$@" >"$STAGE/$_what.csv" 2>"$STAGE/rank.log" ||
+	rank_bg "$_mode" instructions "$@" >"$STAGE/$_what.csv" 2>"$STAGE/rank.log" ||
 		die "ranking failed: $(cat "$STAGE/rank.log")"
 	for level in line function; do
-		"$SCRIPTS/rank" "$_mode" "${level}s" "$@" >"$STAGE/$level-$_what.csv" \
+		rank_bg "$_mode" "${level}s" "$@" >"$STAGE/$level-$_what.csv" \
 			2>"$STAGE/rank-${level}s.log" ||
 			die "ranking by ${level}s failed: $(cat "$STAGE/rank-${level}s.log")"
 	done
 	# the three levels read the same files, so mostly the same warnings
 	sort -u "$STAGE/rank.log" "$STAGE"/rank-*s.log | sed -n 's/^warning: //p' >"$STAGE/rank-warnings"
 	sed "s/^/$NAME: warning: /" "$STAGE/rank-warnings" >&2
+}
+
+# rank_bg <arg>...: runs rank, in the background, so that a signal
+# stops record at once (a trap waits for the command in front), and
+# waits for it
+rank_bg() {
+	"$SCRIPTS/rank" "$@" &
+	RANK_PID=$!
+	_rc=0
+	wait "$RANK_PID" || _rc=$?
+	RANK_PID=
+	return "$_rc"
 }
 
 # rank_levels <what>: meta.txt's lines on the line and function lists
@@ -771,7 +928,9 @@ finish_run() {
 	mv "$STAGE/meta.txt" "$RUN_DIR/$RUN.meta.txt"
 	rmdir "$STAGE"
 	STAGE=
+	lock
 	rmdir "$RUN_DIR/failed" 2>/dev/null || true
+	unlock
 }
 
 # record all: tune, time runs, restore, count
@@ -820,7 +979,7 @@ record_all() {
 	have setpriv || die_cmd "setpriv is not installed" "$(install_hint util-linux util-linux util-linux)"
 	SETPRIV=$(command -v setpriv)
 	if [ -z "$UNTUNED" ] && ! have systemd-run; then
-		die "systemd-run is missing; it is needed to start the program in tune.slice"
+		die_cmd "systemd-run is missing; it is needed to start the program in tune.slice" "$(install_hint systemd systemd systemd)"
 	fi
 	# also with -u: record time -u refuses a tuned system
 	if [ -f /run/tune.state ]; then
@@ -842,6 +1001,8 @@ record_all() {
 	# TUNED first: a signal while tune runs must still lead to a reset
 	tune_system() {
 		TUNED=1
+		# a little before tune starts its radio timer: errs on the safe side
+		TUNED_AT=$(date +%s)
 		# tune rolls itself back if it fails part-way
 		"$SCRIPTS/tune" keep >/dev/null || { TUNED=0; die "tuning failed"; }
 	}
@@ -871,7 +1032,14 @@ record_all() {
 		as_program "${UNTUNED:+1}" warm_up "$@"
 	}
 	warm=0
+	# how long a run takes (the longest so far, the warm-up's at first),
+	# to tell whether the next one ends before tune's time limit for the
+	# radios
+	limit=$(sed -n 's/^RADIO_LIMIT=\([0-9][0-9]*\)$/\1/p' "$SCRIPTS/tune")
+	[ -n "$limit" ] || die "could not read RADIO_LIMIT in $SCRIPTS/tune"
+	took=$(date +%s)
 	warm_command "$@" || warm=$?
+	took=$(($(date +%s) - took))
 	if [ "$warm" != 0 ]; then
 		err=$(tail -n 20 "$WARM_ERR")
 		rm -f "$WARM_ERR"
@@ -882,17 +1050,34 @@ $err}"
 	export RECORD_WARMED_UP=1
 	i=1
 	while [ "$i" -le "$RUNS" ]; do
-		# a long series can outlast tune's time limit for the radios
-		if [ "$TUNED" = 1 ] && [ -n "$(radios_back)" ]; then
-			note "the radios are back on (tune turns them on after an hour); restoring the system and tuning again"
-			"$SCRIPTS/tune" reset >/dev/null || die "restoring the system failed"
-			TUNED=0
-			tune_system
+		# A long series can outlast tune's time limit for the radios, and
+		# a run during which they come back fails. So tune again before a
+		# run that would not end in time: as long as the longest run plus
+		# a tenth and a minute. (Pointless when a single run is longer than
+		# the limit: then it goes on, and fails if the radios come back.)
+		if [ "$TUNED" = 1 ]; then
+			need=$((took + took / 10 + 60))
+			left=$((TUNED_AT + limit - $(date +%s)))
+			why=
+			if [ -n "$(radios_back)" ]; then
+				why="the radios or WireGuard are back on (tune turns them on after an hour)"
+			elif [ "$need" -gt "$left" ] && [ "$need" -le "$limit" ]; then
+				why="the next run (~$((need / 60)) min) would not end before tune turns the radios back on (in $((left / 60)) min)"
+			fi
+			if [ -n "$why" ]; then
+				note "$why; restoring the system and tuning again"
+				"$SCRIPTS/tune" reset >/dev/null || die "restoring the system failed"
+				TUNED=0
+				tune_system
+			fi
 		fi
+		start=$(date +%s)
 		"$SCRIPTS/record" time -n "$NICK" -w "$WORKLOAD" $UNTUNED \
 			${PERIOD:+-c} ${PERIOD:+"$PERIOD"} $QUIET ${MDIR:+-m} ${MDIR:+"$MDIR"} \
 			${MEASURED:+-p} ${MEASURED:+"$MEASURED"} "$@" ||
 			failed=$((failed + 1))
+		# the longest so far: a run that fails early says nothing
+		[ $(($(date +%s) - start)) -le "$took" ] || took=$(($(date +%s) - start))
 		i=$((i + 1))
 	done
 	untune
@@ -947,12 +1132,11 @@ record_time() {
 	# by its path: the program's environment has a PATH of its own
 	SETPRIV=$(command -v setpriv)
 	if [ "$UNTUNED" = 0 ] && ! have systemd-run; then
-		die "systemd-run is missing; it is needed to start the program in tune.slice"
+		die_cmd "systemd-run is missing; it is needed to start the program in tune.slice" "$(install_hint systemd systemd systemd)"
 	fi
 
-	need_ac
-
 	need_root "perf needs it, and so does starting the program in tune.slice"
+	need_ac
 
 	BENCH=
 	if [ "$UNTUNED" = 1 ] && [ -f /run/tune.state ]; then
@@ -976,7 +1160,7 @@ for an untuned baseline run."
 			;;
 		esac
 		[ -z "$(radios_back)" ] ||
-			die_cmd "the radios are back on: tune's time limit for them has passed" \
+			die_cmd "the radios or WireGuard are back on: tune's time limit for them has passed" \
 				"sudo $SCRIPTS/tune reset" \
 				"then tune again."
 	fi
@@ -1024,15 +1208,20 @@ for an untuned baseline run."
 			2>"$STAGE/perf-record.log" ||
 			die "perf record failed: $(cat "$STAGE/perf-record.log")"
 	}
+	# tune writes a new state file (a new inode) each time it tunes, so
+	# the same inode afterwards means one tuning throughout
+	TUNING=
+	[ "$UNTUNED" != 0 ] || TUNING=$(stat -c %i /run/tune.state)
 	as_program "$UNTUNED" perf_record "$@"
 	mv "$PERF_RAM/perf.data" "$STAGE/perf.data"
 	rmdir "$PERF_RAM"
 	PERF_RAM=
 	[ -s "$STAGE/status" ] || die "the program did not run to the end; see $STAGE/perf-record.log"
 	if [ "$UNTUNED" = 0 ]; then
-		[ -f /run/tune.state ] || die "the system was restored during the run, so it was not tuned throughout"
+		[ "$(stat -c %i /run/tune.state 2>/dev/null || true)" = "$TUNING" ] ||
+			die "the system was restored (or tuned again) during the run, so it was not tuned throughout"
 		[ -z "$(radios_back)" ] ||
-			die "the radios came back on during the run (tune's time limit for them passed), so it was noisier than the others"
+			die "the radios or WireGuard came back on during the run (tune's time limit for them passed), so it was noisier than the others"
 	fi
 	status=$(cat "$STAGE/status")
 	rm "$STAGE/status"
@@ -1126,15 +1315,21 @@ $PROG itself (for git: --exec-path; for gcc: -B)."
 	[ "$stat_samples" -gt 0 ] || die "could not read the sample count from perf report --stats"
 	[ "$throttled" = 0 ] && [ "$lost" = 0 ] ||
 		die "perf dropped samples ($throttled throttled, $lost lost), so the counts are incomplete; the kernel's limit is now $(cat /proc/sys/kernel/perf_event_max_sample_rate) samples/s"
+	steady=
 	if [ "$secs" -gt 0 ]; then
 		clock="~$mhz MHz while it ran, $lo-$hi MHz per second ($secs s)"
 		clock_short="$lo-$hi MHz"
+		# more than 1% apart: the clock changed during the run
+		[ $(((hi - lo) * 100)) -le "$mhz" ] ||
+			steady="the clock was not steady: $lo-$hi MHz from second to second, a spread of more than 1% of its median ($mhz MHz)"
 	else
 		clock="~$mhz MHz while it ran (too short for per-second figures)"
 		clock_short="~$mhz MHz"
 	fi
 
+	check_unchanged
 	rank_run time samples "$STAGE/perf.data" "$BASE"
+	check_unchanged
 	rm "$STAGE/rank.log"
 	programs=$(awk -F, -v f="$BASE" 'NR > 1 && $NF == f' "$STAGE/samples.csv" | wc -l)
 	[ "$programs" -gt 0 ] ||
@@ -1169,6 +1364,7 @@ $PROG itself (for git: --exec-path; for gcc: -B)."
 		echo "samples:       $nsamples, at $(($(wc -l <"$STAGE/samples.csv") - 1)) locations, $programs of them in $BASE"
 		rank_levels samples
 		echo "clock:         $clock"
+		[ -z "$steady" ] || echo "warning:       $steady"
 		echo "kernel:        $kernel% of the samples"
 		if [ -n "$BENCH" ]; then
 			echo "while the program ran, on CPU $BENCH:"
@@ -1193,6 +1389,7 @@ $PROG itself (for git: --exec-path; for gcc: -B)."
 	rm -f "$STAGE/perf-record.log" "$STAGE/perf-script.log" "$STAGE/stats" "$STAGE/noise.txt"
 
 	finish_run
+	[ -z "$steady" ] || note "warning: $steady"
 	note "$(shown "$RUN_DIR")/$RUN: $(commas "$nsamples") samples, $clock_short, $kernel% in the kernel; $noise"
 }
 
@@ -1209,19 +1406,26 @@ $PROG itself (for git: --exec-path; for gcc: -B)."
 # --dump-before=_Fork: a fork's child starts with its parent's counts
 # (callgrind copies them), so the parent writes what it counted so far
 # before each fork and starts from zero (glibc 2.34 and later fork
-# through _Fork); rank collect adds the parts up.
+# through _Fork); rank collect adds the parts up. posix_spawn and vfork
+# do not go through _Fork, so they get the same: otherwise a spawned
+# child whose exec fails writes a copy of its parent's counts. Each
+# under both names: with glibc's debug symbols callgrind calls it
+# posix_spawn@@GLIBC_2.15. Not posix_spawn*, which would also match
+# posix_spawnattr_*.
 #
-# Started with &, the command would have SIGINT and SIGQUIT ignored;
-# env gives them back. Its stdin is /dev/null, as in the other count.
+# env sets every signal to its default action (see check_signals). Its
+# stdin is /dev/null, as in the other count.
 count_processes() {
 	CG=$STAGE/callgrind
 	mkdir "$CG"
 	# setsid: its own process group, to stop it with all it started;
 	# started from a script, setsid runs in place, so $! is that group
 	# word splitting intended: ENVIRONMENT is a list of settings
-	setsid env -i --default-signal=INT,QUIT $ENVIRONMENT \
+	setsid env --default-signal env -i $ENVIRONMENT \
 		"$VALGRIND" -v -v -v --tool=callgrind --dump-instr=yes --skip-plt=no \
 		--collect-jumps=yes --trace-children=yes --dump-before=_Fork \
+		--dump-before=posix_spawn '--dump-before=posix_spawn@*' \
+		--dump-before=posix_spawnp '--dump-before=posix_spawnp@*' --dump-before=vfork \
 		--trace-children-skip='*/as,*/ld,*/ld.*,*/collect2,*/ar,*/ranlib,*-linux-gnu-as,*-linux-gnu-ld,*-linux-gnu-ld.*,*-linux-gnu-ar,*-linux-gnu-ranlib' \
 		--callgrind-out-file="$CG/callgrind.%p.out" --log-file="$CG/valgrind.%p.log" \
 		"$@" </dev/null >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" &
@@ -1251,11 +1455,11 @@ count_processes() {
 	rc=$(cat "$STAGE/collect.status" 2>/dev/null || echo 1)
 	rm -f "$STAGE/collect.status"
 	case "$rc" in
-	*stopped) die "summing the counts failed, so the command was stopped: $(cat "$STAGE/collect.log")" ;;
+	*stopped) die "summing the counts failed$(memory_note), so the command was stopped: $(cat "$STAGE/collect.log")" ;;
 	esac
 	# a failed command leaves counts unfinished: that is the cause
 	[ "$status" = 0 ] || program_failed "$status" "the command"
-	[ "$rc" = 0 ] || die "summing the counts failed: $(cat "$STAGE/collect.log")"
+	[ "$rc" = 0 ] || die "summing the counts failed$(memory_note): $(cat "$STAGE/collect.log")"
 	rm "$CG/finished"
 	rmdir "$CG"
 	sed -n 's/^warning: //p' "$STAGE/collect.log" | sed "s/^/$NAME: warning: /" >&2
@@ -1285,9 +1489,21 @@ record_count() {
 	take_command "$MEASURED" "$@"
 	[ -n "$STARTER" ] || shift
 
-	have valgrind || die_cmd "valgrind is not installed" "$(install_hint valgrind valgrind valgrind)"
-	# by its path: the program's environment has a PATH of its own
-	VALGRIND=$(command -v valgrind)
+	# ours (make valgrind) when built, else the system's; on arm64 the
+	# system's lets callgrind's call stack grow without end (see the
+	# Makefile). By its path: the program's environment has a PATH of
+	# its own.
+	VALGRIND=$(dirname "$SCRIPTS")/build/valgrind/bin/valgrind
+	if [ ! -x "$VALGRIND" ]; then
+		[ "$(uname -m)" != aarch64 ] ||
+			die_cmd "on arm64, counts need our valgrind, build/valgrind" "make -C $(quote "$(dirname "$SCRIPTS")") valgrind"
+		have valgrind || die_cmd "valgrind is not installed" "$(install_hint valgrind valgrind valgrind)"
+		VALGRIND=$(command -v valgrind)
+		# Debian's and Ubuntu's valgrind is a script that adds
+		# LD_LIBRARY_PATH and GLIBCXX_FORCE_NEW to the program's
+		# environment, then runs valgrind.bin
+		[ ! -x "$VALGRIND.bin" ] || VALGRIND=$VALGRIND.bin
+	fi
 	need_python
 	for c in nm objdump readelf; do
 		have "$c" || die_cmd "$c is not installed" "$(install_hint binutils binutils binutils)"
@@ -1302,26 +1518,36 @@ record_count() {
 	# platforms what follows the call, to the calling instruction.
 	note "counting $BASE's instructions as $RUN, under callgrind (slow)"
 	RUN_UID=$(id -u)
+	OOM_BEFORE=$(oom_kills)
 	status=0
 	if [ -z "$STARTER" ]; then
 		# word splitting intended: ENVIRONMENT is a list of settings
-		env -i $ENVIRONMENT \
+		# in the background, so that a TERM (from measure) stops record at
+		# once; env sets every signal to its default (see check_signals)
+		env --default-signal env -i $ENVIRONMENT \
 			"$VALGRIND" -v -v -v --tool=callgrind --dump-instr=yes --skip-plt=no \
 			--collect-jumps=yes \
 			--callgrind-out-file="$STAGE/callgrind.out" --log-file="$STAGE/valgrind.log" \
-			"$PROG" "$@" </dev/null >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" || status=$?
+			"$PROG" "$@" </dev/null >"${OUT:-$STAGE/program.out}" 2>"$STAGE/program.err" &
+		VG_PID=$!
+		wait "$VG_PID" || status=$?
+		VG_PID=
 		[ "$status" = 0 ] || program_failed "$status"
+		check_unchanged
 		rank_run count counts "$STAGE/callgrind.out" "$STAGE/valgrind.log"
 	else
 		count_processes "$@"
+		check_unchanged
 		rank_run count counts "$STAGE/counts.sum.gz"
 	fi
+	check_unchanged
 	programs=$(awk -F, -v f="$BASE" 'NR > 1 && $NF == f' "$STAGE/counts.csv" | wc -l)
 	[ "$programs" -gt 0 ] ||
-		die "no counts for $BASE's own code; the object names in callgrind.out do not match it"
+		die "no counts for $BASE's own code; the object names callgrind recorded do not match it"
 
 	{
 		meta_common "$ARGS"
+		echo "valgrind:      $("$VALGRIND" --version), $VALGRIND"
 		[ -z "$STARTER" ] || sed '/^warning: /d' "$STAGE/collect.log"
 		sed '/^warning: /d' "$STAGE/rank.log"
 		echo "instructions:  $(($(wc -l <"$STAGE/counts.csv") - 1)) ran, $programs of them in $BASE"
@@ -1335,11 +1561,30 @@ record_count() {
 	note "$(shown "$RUN_DIR")/$RUN: $total instructions ran, at $(commas "$(($(wc -l <"$RUN_DIR/$RUN.counts.csv") - 1))") addresses, $(commas "$programs") of them in $BASE"
 }
 
+# record platform: the platform file that describes this system as it
+# is now, by name; nothing if there is none (the next run creates it)
+record_platform() {
+	NICK=
+	MDIR=
+	while getopts hn:m: opt; do
+		case "$opt" in
+		h) usage 0 ;;
+		n) NICK=$OPTARG ;;
+		m) MDIR=$OPTARG ;;
+		*) usage ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	[ $# = 0 ] || usage
+	check_nick "$NICK"
+	find_platform "${MDIR:-$SCRIPTS/../measurements}" "$NICK" "$(platform)"
+}
+
 case "${1:-}" in
 -h | --help)
 	usage 0
 	;;
-all | time | count)
+all | time | count | platform)
 	cmd=$1
 	shift
 	case "${1:-}" in

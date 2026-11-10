@@ -21,8 +21,9 @@
 #
 # Tuning dedicates the physical core owning the CPU to measuring: takes
 # its SMT sibling(s) offline, shields it from the scheduler, steers IRQs
-# off it, pins the clock, and turns off THP, swap, radios and some
-# background services. reset puts back what was there before.
+# off it, pins the clock, and turns off THP, swap, radios, WireGuard
+# links, some background services and the timers of background jobs
+# (package updates and the like). reset puts back what was there before.
 #
 # ASLR is left on: with it off every run gets the same memory layout,
 # which may be a lucky or an unlucky one (Mytkowicz et al. 2009); with
@@ -30,17 +31,17 @@
 # the effect.
 #
 # After every change tune checks that it took effect. If one did not, or
-# on Ctrl-C, tune stops and undoes what it did. reset checks too: if a
-# radio, a swap device or a service did not come back, it names it and
-# exits with an error; run it again.
+# on Ctrl-C, tune stops and undoes what it did. reset checks too: if
+# something did not come back as it was, it names it and exits with an
+# error; run it again.
 #
-# The radios come back on by themselves an hour after tuning, even if
-# this script is killed or never reset: a machine reached only over
-# Wi-Fi (a Raspberry Pi over ssh, say) would otherwise stay out of
-# reach. Over such a connection the session freezes while they are off,
+# The radios and WireGuard come back on by themselves an hour after
+# tuning, even if this script is killed or never reset: a machine
+# reached only over Wi-Fi or WireGuard (a Raspberry Pi over ssh, say)
+# would otherwise stay out of reach. Over such a connection the session freezes while they are off,
 # so run tune and record inside screen or tmux there.
 #
-# Needs only util-linux, systemd and coreutils (no Python or
+# Needs only util-linux, systemd, iproute2 and coreutils (no Python or
 # out-of-distro packages).
 # Assumes /sys/devices/system/cpu/present is a contiguous range "0-N".
 # Boot-time isolation (isolcpus=, nohz_full=, rcu_nocbs=) needs a
@@ -48,15 +49,51 @@
 
 set -eu
 
+# A reset stopped half-way would leave radios, swap or services off, so
+# it ignores the signals that could stop it from the very start.
+case "${1:-}" in
+reset) trap '' HUP INT TERM PIPE ;;
+esac
+
 STATE=/run/tune.state
+LOCK=/run/tune.lock
 ARMED=0
 
-# perf's sampling ceiling while tuned (see the sample rate step below)
-SAMPLE_RATE=100000
+# perf's sampling ceiling while tuned (see the sample rate step below).
+# The kernel lets a perf event take SAMPLE_RATE / HZ interrupts between
+# two timer ticks, and only a tick resets that count
+# (__perf_event_account_interrupt in kernel/events/core.c). On a CPU
+# with nohz_full there is hardly a tick while one program runs, so the
+# count runs out: at 100000 perf paused every 32,300 samples on the T14
+# (100 interrupts of 323 PEBS samples each), and record refuses such
+# runs. At 100000000 the count lasts about 32 million samples, an hour
+# of sampling at our period. The limit only stops a runaway sampler;
+# the period (-c) sets how often perf samples.
+SAMPLE_RATE=100000000
 
 # seconds until the radios are turned back on regardless (see
 # guard_radios); longer than any tuned session should take
 RADIO_LIMIT=3600
+
+# Top-level slices kept off the measured CPU even if they do not exist
+# yet: a slice made later starts on all CPUs. measure runs its counts in
+# inf2204counts.slice (also while another run is tuned, on the Pi);
+# machine.slice holds virtual machines and containers.
+FENCE="init.scope system.slice user.slice machine.slice inf2204counts.slice"
+
+# Timers of background jobs, paused while tuned: package updates (a
+# library updated between runs would change what is counted), and jobs
+# that read the whole disk or rebuild indexes. The jobs run on the other
+# CPUs, but share memory, caches and the disk with the measured one.
+TIMERS="apt-daily apt-daily-upgrade dnf-makecache dnf-automatic
+dnf-automatic-install man-db motd-news update-notifier-download
+update-notifier-motd fwupd-refresh plocate-updatedb mlocate anacron
+logrotate e2scrub_all fstrim dpkg-db-backup apport-autoreport
+snapd.snap-repair"
+
+# services that update packages; tuning waits for them to finish
+UPDATERS="apt-daily-upgrade.service apt-daily.service
+dnf-automatic.service dnf-automatic-install.service"
 
 die() {
 	echo "tune: error: $1" >&2
@@ -78,8 +115,10 @@ die_cmd() {
 	exit 1
 }
 
+# A message that cannot be printed (into a pipe whose reader has gone)
+# must not stop tune half-way or turn a success into a failure.
 note() {
-	echo "tune: $1" >&2
+	echo "tune: $1" >&2 || :
 }
 
 # usage [0]: prints the header's Usage block and exits; with 0 (for -h)
@@ -131,6 +170,20 @@ on_exit() {
 	exit "$rc"
 }
 
+# One tune at a time: two would mix up the state file, and a reset while
+# another tune is tuning or rolling back would undo half of it. A reset
+# waits for the other one to finish (record resets on Ctrl-C while the
+# tune keep it started rolls back by itself); a held tuning keeps the
+# lock until it ends.
+take_lock() {
+	have flock || return 0
+	exec 9>"$LOCK"
+	flock -n 9 && return 0
+	note "waiting for another tune to finish (up to 60 s)"
+	flock -w 60 9 ||
+		die "another tune is still running after 60 s (a tune hold, perhaps); stop it first"
+}
+
 cpu_max() {
 	r=$(cat /sys/devices/system/cpu/present)
 	echo "${r#*-}"
@@ -143,6 +196,7 @@ expand_cpulist() {
 	IFS=$oldifs
 	for tok in "$@"; do
 		case $tok in
+		"") ;;
 		*-*)
 			n=${tok%-*}
 			hi=${tok#*-}
@@ -209,9 +263,18 @@ cpulist_to_mask() {
 	echo "$out"
 }
 
-# compare two cpulists by content, so "0,1,2,4" matches "0-2,4"
+# compare two cpulists by content, so "0,1,2,4" matches "0-2,4"; also
+# in systemctl's form, with spaces ("0-2 4")
 cpulist_norm() {
-	expand_cpulist "$1" | sort -n | tr '\n' ' '
+	expand_cpulist "$(echo "$1" | tr -s ' ' ,)" | sort -n | tr '\n' ' '
+}
+
+# cpulist_has <list> <cpu>
+cpulist_has() {
+	case " $(cpulist_norm "$1")" in
+	*" $2 "*) return 0 ;;
+	esac
+	return 1
 }
 
 # empty on a kernel built without THP (Raspberry Pi OS's): nothing to
@@ -232,6 +295,14 @@ saved_freqs() {
 	done
 }
 
+saved_governors() {
+	for d in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+		g=$(cat "$d/scaling_governor" 2>/dev/null) || continue
+		c=${d%/cpufreq}
+		printf '%s:%s ' "${c##*/cpu}" "$g"
+	done
+}
+
 saved_epps() {
 	for d in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
 		p=$(cat "$d/energy_performance_preference" 2>/dev/null) || continue
@@ -245,6 +316,28 @@ saved_irqs() {
 		a=$(cat "$f" 2>/dev/null) || continue
 		n=${f#/proc/irq/}
 		printf '%s:%s ' "${n%%/*}" "$a"
+	done
+}
+
+# The top-level slices and scopes to keep off the measured CPU: those in
+# FENCE and every other one there is now, but tune.slice.
+top_units() {
+	{
+		printf '%s\n' $FENCE
+		for d in /sys/fs/cgroup/*.slice /sys/fs/cgroup/*.scope; do
+			if [ -d "$d" ] && [ "${d##*/}" != tune.slice ]; then
+				echo "${d##*/}"
+			fi
+		done
+	} | sort -u | tr '\n' ' '
+}
+
+# each as "unit=CPUs it was allowed" (empty: no limit of its own); "="
+# because a unit name may have a colon
+saved_slices() {
+	for u in $(top_units); do
+		a=$(systemctl show --property=AllowedCPUs --value "$u" 2>/dev/null || true)
+		printf '%s=%s ' "$u" "$(echo "$a" | tr -s ' ' ,)"
 	done
 }
 
@@ -263,9 +356,10 @@ swap_kb() {
 	awk 'NR>1 {s+=$3} END {print s+0}' /proc/swaps
 }
 
-# Makes sure the radios about to be blocked come back, whatever happens
-# to this script, the session it runs in or the machine. Takes them from
-# radios and radio_types.
+# Makes sure the radios about to be blocked, and the WireGuard links
+# about to go down, come back, whatever happens to this script, the
+# session it runs in or the machine. Takes them from radios, radio_types
+# and WG_UP (the commands that bring the links back).
 guard_radios() {
 	# A timer of systemd's own turns them on again after RADIO_LIMIT. It
 	# only unblocks; the rest of the tuning stays until reset. By id and
@@ -274,12 +368,13 @@ guard_radios() {
 	rf=$(command -v rfkill)
 	cmd=
 	if [ "$radios" = unknown ]; then
-		cmd="$rf unblock all"
+		cmd="$rf unblock all; "
 	else
 		for r in $radios $radio_types; do
 			cmd="$cmd$rf unblock $r; "
 		done
 	fi
+	cmd="$cmd$WG_UP"
 	# one left over from a tuning that was never reset would make
 	# systemd-run refuse the name
 	radio_timer_off
@@ -298,6 +393,9 @@ guard_radios() {
 		# it writes a change only as it exits, 5 s after the last one;
 		# stopped before that, it loses the change
 		wait_rfkill_saved
+		# noted before masking: reset must start it again even if the
+		# mask is gone by then (a reset that unmasked it, then failed)
+		echo "rfkill_masked=1" >>"$STATE"
 		systemctl mask --runtime --now --quiet systemd-rfkill.socket systemd-rfkill.service ||
 			die "could not stop systemd-rfkill from saving the radios' state for the next boot"
 		[ "$(systemctl is-enabled systemd-rfkill.socket 2>/dev/null)" = masked-runtime ] ||
@@ -323,12 +421,25 @@ radio_timer_off() {
 	systemctl reset-failed tune-radios.timer tune-radios.service 2>/dev/null || true
 }
 
-# undoes guard_radios' mask; fails if there was none
+rfkill_mask_left() {
+	[ -L /run/systemd/system/systemd-rfkill.socket ] ||
+		[ -L /run/systemd/system/systemd-rfkill.service ]
+}
+
+# Undoes guard_radios' mask and starts systemd-rfkill again. Returns 1
+# if tune had not masked it (nothing done), 2 if it does not run again.
 rfkill_saving_on() {
-	[ -L /run/systemd/system/systemd-rfkill.socket ] || return 1
-	systemctl unmask --runtime --quiet systemd-rfkill.socket systemd-rfkill.service 2>/dev/null &&
-		systemctl start systemd-rfkill.socket 2>/dev/null ||
+	if rfkill_mask_left; then
+		systemctl unmask --runtime --quiet systemd-rfkill.socket systemd-rfkill.service 2>/dev/null || true
+	elif [ "${rfkill_masked:-0}" != 1 ]; then
+		return 1
+	fi
+	systemctl is-active --quiet systemd-rfkill.socket 2>/dev/null ||
+		systemctl start systemd-rfkill.socket 2>/dev/null || true
+	if rfkill_mask_left || ! systemctl is-active --quiet systemd-rfkill.socket 2>/dev/null; then
 		note "warning: could not turn systemd-rfkill back on; radio changes are not remembered until the next boot"
+		return 2
+	fi
 }
 
 # types among $1 that have a blocked radio
@@ -383,7 +494,10 @@ restore_radios() {
 			rfkill unblock "$id" 2>/dev/null || true
 		done
 	fi
-	if rfkill_saving_on; then
+	saving=0
+	rfkill_saving_on || saving=$?
+	case $saving in
+	0)
 		# Started again, systemd-rfkill sets every radio to the state it
 		# has saved for it, which need not be the one it had before
 		# tuning. Wait for that (it starts a moment after its socket);
@@ -391,7 +505,9 @@ restore_radios() {
 		# then saves that.
 		sleep 2
 		wait_rfkill_saved
-	fi
+		;;
+	2) lost="$lost systemd-rfkill;" ;;
+	esac
 	changed=
 	failed=
 
@@ -473,6 +589,87 @@ restore_radios() {
 	fi
 }
 
+# WireGuard puts its encryption and sending work on any online CPU,
+# isolated or not (drivers/net/wireguard/queueing.h picks from
+# cpu_online_mask): on the T14 a peer's work ran on CPU 3 about 170
+# times in the 90 s after the radios went off, while WireGuard retried
+# its handshake, and kept the tick on there. So its links go down while
+# tuned, through whatever runs them.
+
+# The WireGuard links that are up now, one per line as kind:link:id;
+# kind is quick (wg-quick@<link>), nm (NetworkManager; id is the
+# connection's UUID), networkd, or other (none of these: left up, as a
+# plain "ip link set down" would lose its routes).
+wireguard_links() {
+	have ip || return 0
+	# "up": a link that was down before stays down
+	for l in $(ip -br link show type wireguard up 2>/dev/null | awk '{ sub(/@.*/, "", $1); print $1 }'); do
+		if systemctl is-active --quiet "wg-quick@$l.service" 2>/dev/null; then
+			echo "quick:$l:-"
+		elif u=$(nm_connection "$l") && [ -n "$u" ]; then
+			echo "nm:$l:$u"
+		elif have networkctl && networkctl list --no-legend 2>/dev/null |
+			awk -v l="$l" '$2 == l && $5 == "configured" { f = 1 } END { exit !f }'; then
+			echo "networkd:$l:-"
+		else
+			echo "other:$l:-"
+		fi
+	done
+}
+
+# The UUID of the NetworkManager connection active on link $1, if
+# NetworkManager runs it (not one it only sees, "externally")
+nm_connection() {
+	have nmcli || return 1
+	nmcli -t -f DEVICE,STATE dev 2>/dev/null | grep -qx "$1:connected" || return 1
+	nmcli -t -f DEVICE,UUID connection show --active 2>/dev/null |
+		awk -F: -v l="$1" '$1 == l { print $2; exit }'
+}
+
+# The command that brings one link (kind:link:id) down or back up
+wireguard_cmd() {
+	k=$1
+	l=${k#*:}
+	id=${l#*:}
+	l=${l%%:*}
+	case "$2:${k%%:*}" in
+	down:quick) echo "systemctl stop wg-quick@$l.service" ;;
+	up:quick) echo "systemctl start wg-quick@$l.service" ;;
+	down:nm) echo "nmcli connection down uuid $id" ;;
+	up:nm) echo "nmcli connection up uuid $id" ;;
+	down:networkd) echo "networkctl down $l" ;;
+	up:networkd) echo "networkctl up $l" ;;
+	esac
+}
+
+wireguard_is_up() {
+	ip -o link show dev "$1" 2>/dev/null | grep -q '[<,]UP[,>]'
+}
+
+# Brings the links in $wireguard back up, waiting up to a minute each:
+# wg-quick looks up its peers' names, which fails until the network is
+# back after the radios. Adds those that stay down to lost. (The timer
+# that would also bring them back is turned off with the radios'.)
+restore_wireguard() {
+	[ -n "${wireguard:-}" ] || return 0
+	for k in $wireguard; do
+		l=${k#*:}
+		l=${l%%:*}
+		waited=0
+		while :; do
+			wireguard_is_up "$l" && break
+			$(wireguard_cmd "$k" up) >/dev/null 2>&1 || true
+			wireguard_is_up "$l" && break
+			if [ "$waited" -ge 60 ]; then
+				lost="$lost WireGuard link $l;"
+				break
+			fi
+			sleep 5
+			waited=$((waited + 5))
+		done
+	done
+}
+
 set_verify() {
 	path=$1
 	want=$2
@@ -484,7 +681,7 @@ set_verify() {
 preflight() {
 	[ "$(id -u)" = 0 ] || die_cmd "must run as root" "sudo $0 $ARGS"
 
-	for c in systemctl systemd-run awk sed sort tr; do
+	for c in systemctl systemd-run awk sed sort tr flock; do
 		have "$c" || die "missing required command: $c"
 	done
 
@@ -527,18 +724,55 @@ CPU shielding at all."
 		die "no AC adapter detected -- plug in the power cable; on battery the CPU clock can drop mid-run"
 	fi
 
-	# intel_pstate and nohz_full are incompatible: with nohz_full the
-	# CPU frequency goes unstable under intel_pstate.
-	# https://bugzilla.redhat.com/show_bug.cgi?id=1378529
-	if [ -d /sys/devices/system/cpu/intel_pstate ]; then
-		nhf=$(cat /sys/devices/system/cpu/nohz_full 2>/dev/null || echo "")
-		case "$nhf" in
-		"" | "(null)") ;;
-		*) die "nohz_full=$nhf is active together with the intel_pstate driver; that combination makes the CPU frequency unstable (RH bug 1378529). Drop nohz_full= or boot with intel_pstate=disable." ;;
-		esac
-	fi
+	# nohz_full used to be refused together with intel_pstate, after a
+	# 2016 report that the pair makes the clock unstable (Red Hat bug
+	# 1378529), never tried here. Now it is allowed: record logs the
+	# clock every second of a time run in meta.txt and warns if it was
+	# not steady, which is the check.
 
 	[ -r /sys/devices/system/cpu/present ] || die "cannot read /sys/devices/system/cpu/present"
+}
+
+# The CPU tune.slice is limited to, if just one (while tuned).
+tuned_cpu() {
+	b=$(systemctl show --property=AllowedCPUs --value tune.slice 2>/dev/null || true)
+	case "$b" in
+	"" | *[!0-9]*) return 1 ;;
+	esac
+	echo "$b"
+}
+
+# The top-level cgroups but tune.slice that may run on CPU $1. Only those
+# with processes in them: systemd keeps an empty one for each early
+# mount (dev-hugepages.mount and the like).
+cgroups_on() {
+	for d in /sys/fs/cgroup/*/; do
+		d=${d%/}
+		[ "${d##*/}" != tune.slice ] || continue
+		! grep -qx 'populated 0' "$d/cgroup.events" 2>/dev/null || continue
+		e=$(cat "$d/cpuset.cpus.effective" 2>/dev/null) || continue
+		if cpulist_has "$e" "$1"; then
+			printf '%s ' "${d##*/}"
+		fi
+	done
+}
+
+# Raspberry Pi firmware: vcgencmd get_throttled prints throttled=0x...;
+# bits 0-3 are under-voltage, a capped clock, throttling and the soft
+# temperature limit now, bits 16-19 the same since boot. Prints the
+# value, or nothing where there is no such firmware.
+firmware_throttled() {
+	have vcgencmd || return 0
+	t=$(vcgencmd get_throttled 2>/dev/null) || return 0
+	v=${t#throttled=}
+	case "$v" in
+	0x*) ;;
+	*) return 0 ;;
+	esac
+	case "${v#0x}" in
+	"" | *[!0-9a-fA-F]*) return 0 ;;
+	esac
+	echo "$v"
 }
 
 report() {
@@ -567,6 +801,10 @@ report() {
 		fi
 	done
 	echo "ceiling below max:  ${capped:- none}"
+	thr=$(firmware_throttled)
+	if [ -n "$thr" ]; then
+		echo "firmware throttled:  $thr (0x0: never since boot)"
+	fi
 	ac=$(cat /sys/class/power_supply/A*/online 2>/dev/null | head -1)
 	echo "on AC power:         ${ac:-n/a}"
 	echo "ASLR:                $(cat /proc/sys/kernel/randomize_va_space)"
@@ -577,8 +815,14 @@ report() {
 	echo "perf cpu time limit: $(cat /proc/sys/kernel/perf_cpu_time_max_percent 2>/dev/null || echo n/a) % (0: off)"
 	echo "system.slice cpus:   $(cat /sys/fs/cgroup/system.slice/cpuset.cpus.effective 2>/dev/null || echo n/a)"
 	echo "user.slice cpus:     $(cat /sys/fs/cgroup/user.slice/cpuset.cpus.effective 2>/dev/null || echo n/a)"
+	if b=$(tuned_cpu); then
+		on=$(cgroups_on "$b")
+		echo "others on CPU $b:     ${on:-none}"
+	fi
 	echo "radios:              $(rfkill -n -o TYPE,SOFT 2>/dev/null | tr '\n' ' ' || true)"
 	echo "radio timer:         $(systemctl is-active tune-radios.timer 2>/dev/null || true)"
+	wg=$(wireguard_links | awk -F: '{ printf "%s ", $2 }')
+	echo "WireGuard links up:  ${wg:-none}"
 	echo "tuning state file:   $([ -f "$STATE" ] && echo present || echo absent)"
 }
 
@@ -587,65 +831,78 @@ do_reset() {
 	# would stay off
 	trap '' HUP INT TERM PIPE
 	max=$(cpu_max)
+	# what did not come back; with any, the state file stays for another
+	# reset
+	lost=
 
+	offline=
 	i=0
 	while [ "$i" -le "$max" ]; do
 		f="/sys/devices/system/cpu/cpu$i/online"
 		if [ -f "$f" ] && [ "$(cat "$f")" = 0 ]; then
-			echo 1 > "$f" || note "warning: could not bring cpu $i back online"
+			echo 1 > "$f" 2>/dev/null || true
+			[ "$(cat "$f")" = 1 ] || offline="$offline $i"
 		fi
 		i=$((i + 1))
 	done
 
-	# empty unless the state file saved them (older ones did not)
-	freqs=
-	epps=
-	irqs=
-	had_state=0
-	if [ -f "$STATE" ]; then
-		had_state=1
-		. "$STATE"
-		if [ "$governor" != unknown ]; then
-			for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-				if [ -w "$f" ]; then
-					echo "$governor" > "$f" 2>/dev/null || true
-				fi
-			done
-		fi
-		# after the governor: with the performance governor the kernel
-		# refuses any other preference
-		for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
-			c=${f%/cpufreq/*}
-			p=$(lookup "$epps" "${c##*/cpu}") && echo "$p" > "$f" 2>/dev/null || true
+	if [ ! -f "$STATE" ]; then
+		had_state=0
+		# Nothing says how things were. Radios, swap, services, clock
+		# limits and IRQs may be as their owner wants them (a reset with
+		# nothing to undo once turned Bluetooth on), so they are left
+		# alone. What tuning leaves that nobody wants is undone: offline
+		# CPUs, slices kept off a CPU, systemd-rfkill masked.
+		for u in $(top_units) tune.slice; do
+			systemctl set-property --runtime "$u" AllowedCPUs="0-$max" 2>/dev/null || true
 		done
-		if [ "$turbo" != unknown ]; then
-			echo "$turbo" > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true
-		fi
-		if [ "${boost:-unknown}" != unknown ]; then
-			echo "$boost" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true
-		fi
-		# before the sample rate: the kernel refuses that write while
-		# the limit is off
-		if [ "${cputime:-unknown}" != unknown ]; then
-			echo "$cputime" > /proc/sys/kernel/perf_cpu_time_max_percent 2>/dev/null || true
-		fi
-		if [ "$samplerate" != unknown ]; then
-			echo "$samplerate" > /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || true
-		fi
-		if [ -n "$thp" ]; then
-			echo "$thp" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-		fi
+		rfkill_saving_on || true
+		[ -z "$offline" ] || note "warning: could not bring CPU$offline back online"
+		note "no saved state ($STATE): only offline CPUs and the slices' CPU limits put back; the rest is left as it is"
+		return 0
+	fi
+	had_state=1
+	. "$STATE"
+
+	# per CPU; an older state file has cpu0's for all
+	for d in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+		c=${d%/cpufreq}
+		g=$(lookup "${governors-}" "${c##*/cpu}") || g=${governor:-unknown}
+		[ "$g" = unknown ] || echo "$g" > "$d/scaling_governor" 2>/dev/null || true
+	done
+	# after the governor: with the performance governor the kernel
+	# refuses any other preference
+	for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+		c=${f%/cpufreq/*}
+		p=$(lookup "${epps-}" "${c##*/cpu}") && echo "$p" > "$f" 2>/dev/null || true
+	done
+	if [ "${turbo:-unknown}" != unknown ]; then
+		echo "$turbo" > /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || true
+	fi
+	if [ "${boost:-unknown}" != unknown ]; then
+		echo "$boost" > /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || true
+	fi
+	# before the sample rate: the kernel refuses that write while
+	# the limit is off
+	if [ "${cputime:-unknown}" != unknown ]; then
+		echo "$cputime" > /proc/sys/kernel/perf_cpu_time_max_percent 2>/dev/null || true
+	fi
+	if [ "${samplerate:-unknown}" != unknown ]; then
+		echo "$samplerate" > /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || true
+	fi
+	if [ -n "${thp:-}" ]; then
+		echo "$thp" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
 	fi
 
 	# Restoring turbo does not lift the ceiling of a CPU that was offline
 	# while turbo was off (observed: the SMT sibling stayed at 800 MHz),
 	# so both limits are set back explicitly, after turbo: to the saved
 	# ones, or else the hardware's.
+	clocks=
 	for d in /sys/devices/system/cpu/cpu*/cpufreq; do
-		[ -w "$d/scaling_min_freq" ] && [ -w "$d/scaling_max_freq" ] || continue
 		[ -r "$d/cpuinfo_min_freq" ] && [ -r "$d/cpuinfo_max_freq" ] || continue
 		c=${d%/cpufreq}
-		if f=$(lookup "$freqs" "${c##*/cpu}"); then
+		if f=$(lookup "${freqs-}" "${c##*/cpu}"); then
 			lo=${f%:*}
 			hi=${f#*:}
 		else
@@ -656,41 +913,43 @@ do_reset() {
 		cat "$d/cpuinfo_min_freq" > "$d/scaling_min_freq" 2>/dev/null || true
 		echo "$hi" > "$d/scaling_max_freq" 2>/dev/null || true
 		echo "$lo" > "$d/scaling_min_freq" 2>/dev/null || true
-		if [ "$(cat "$d/scaling_max_freq")" != "$hi" ]; then
-			note "warning: $c is capped at $(cat "$d/scaling_max_freq") kHz, not $hi kHz as before"
+		if [ "$(cat "$d/scaling_max_freq" 2>/dev/null)" != "$hi" ] ||
+			[ "$(cat "$d/scaling_min_freq" 2>/dev/null)" != "$lo" ]; then
+			clocks="$clocks ${c##*/cpu}"
 		fi
 	done
 	if [ "${defaffinity:-unknown}" != unknown ]; then
 		echo "$defaffinity" > /proc/irq/default_smp_affinity 2>/dev/null || true
 	fi
 
-	for u in init.scope system.slice user.slice tune.slice; do
-		systemctl set-property --runtime "$u" AllowedCPUs="0-$max" 2>/dev/null || true
-	done
-	# IRQs registered while tuned have no saved affinity: all CPUs.
-	# Some IRQs refuse any write (the kernel manages their affinity).
-	for f in /proc/irq/[0-9]*/smp_affinity_list; do
-		n=${f#/proc/irq/}
-		a=$(lookup "$irqs" "${n%%/*}") || a="0-$max"
-		echo "$a" > "$f" 2>/dev/null || true
+	# An older state file has no list: the three slices it restricted.
+	if [ "${slices+set}" = set ]; then
+		sl=$slices
+	else
+		sl="init.scope= system.slice= user.slice="
+	fi
+	for kv in $sl tune.slice=; do
+		a=${kv#*=}
+		systemctl set-property --runtime "${kv%%=*}" AllowedCPUs="${a:-0-$max}" 2>/dev/null || true
 	done
 
-	# Radios, swap and services are put back as they were. Without a state
-	# file they may be off by choice (a reset with nothing to undo once
-	# turned Bluetooth on), so they are left alone. An older tune's state
-	# file lacks the lists: then all are turned on.
-	if [ "$had_state" = 0 ]; then
-		note "no saved state ($STATE): clock limits and IRQs set to their defaults; radios, swap and services left as they are"
-		rfkill_saving_on || true
-		return 0
-	fi
-	# what did not come back; with any, the state file stays for another
-	# reset
-	lost=
+	# Radios, swap and services are put back as they were. An older
+	# tune's state file lacks the lists: then all are turned on.
 	radios=${radios-unknown}
 	radio_types=${radio_types-}
 	radio_states=${radio_states-}
 	restore_radios
+
+	# IRQs after the radios: a driver may set its IRQs up anew when its
+	# radio comes back. IRQs registered while tuned have no saved
+	# affinity: all CPUs. Some IRQs refuse any write (the kernel manages
+	# their affinity).
+	for f in /proc/irq/[0-9]*/smp_affinity_list; do
+		n=${f#/proc/irq/}
+		a=$(lookup "${irqs-}" "${n%%/*}") || a="0-$max"
+		echo "$a" > "$f" 2>/dev/null || true
+	done
+
 	if [ "${swaps+set}" = set ]; then
 		# not swapon -a: a swap file set up outside /etc/fstab (Raspberry
 		# Pi OS's, say) would stay off
@@ -719,6 +978,82 @@ do_reset() {
 			systemctl is-active --quiet "$svc" || lost="$lost $svc;"
 		fi
 	done
+
+	# after the radios: wg-quick needs the network to find its peers
+	restore_wireguard
+
+	# Read back what was written above. Most settings must be as saved.
+	# Some can be changed by others meanwhile (power-profiles-daemon sets
+	# the EPP, the kernel lowers the perf sample rate, a driver sets its
+	# IRQs): those count only if still as tuning left them.
+	[ -z "$offline" ] || lost="$lost CPU$offline offline;"
+	govs=
+	epp=
+	for d in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+		c=${d%/cpufreq}
+		n=${c##*/cpu}
+		g=$(lookup "${governors-}" "$n") || g=${governor:-unknown}
+		if [ "$g" != unknown ] && [ "$(cat "$d/scaling_governor" 2>/dev/null)" != "$g" ]; then
+			govs="$govs $n"
+		fi
+		if p=$(lookup "${epps-}" "$n") && [ "$p" != performance ] &&
+			[ "$(cat "$d/energy_performance_preference" 2>/dev/null)" = performance ]; then
+			epp="$epp $n"
+		fi
+	done
+	[ -z "$govs" ] || lost="$lost governor of CPU$govs;"
+	[ -z "$epp" ] || lost="$lost energy preference of CPU$epp;"
+	[ -z "$clocks" ] || lost="$lost clock limits of CPU$clocks;"
+	if [ "${turbo:-unknown}" != unknown ] &&
+		[ "$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null)" != "$turbo" ]; then
+		lost="$lost turbo;"
+	fi
+	if [ "${boost:-unknown}" != unknown ] &&
+		[ "$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null)" != "$boost" ]; then
+		lost="$lost boost;"
+	fi
+	if [ "${cputime:-unknown}" != unknown ] &&
+		[ "$(cat /proc/sys/kernel/perf_cpu_time_max_percent 2>/dev/null)" != "$cputime" ]; then
+		lost="$lost perf cpu time limit;"
+	fi
+	if [ "${samplerate:-unknown}" != unknown ] && [ "$samplerate" != "$SAMPLE_RATE" ] &&
+		[ "$(cat /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null)" = "$SAMPLE_RATE" ]; then
+		lost="$lost perf sample rate;"
+	fi
+	if [ -n "${thp:-}" ] && [ "$(thp_current)" != "$thp" ]; then
+		lost="$lost THP;"
+	fi
+	if [ "${defaffinity:-unknown}" != unknown ] &&
+		[ "$(cat /proc/irq/default_smp_affinity 2>/dev/null)" != "$defaffinity" ]; then
+		lost="$lost default IRQ affinity;"
+	fi
+	units=
+	for kv in $sl tune.slice=; do
+		u=${kv%%=*}
+		a=${kv#*=}
+		# a scope that has ended is gone with its setting
+		case "$u" in
+		*.scope) [ -d "/sys/fs/cgroup/$u" ] || continue ;;
+		esac
+		got=$(systemctl show --property=AllowedCPUs --value "$u" 2>/dev/null || true)
+		# empty: no limit, all CPUs
+		[ "$(cpulist_norm "${got:-0-$max}")" = "$(cpulist_norm "${a:-0-$max}")" ] || units="$units $u"
+	done
+	[ -z "$units" ] || lost="$lost CPUs allowed for$units;"
+	moved=
+	if [ -n "${system_cpus:-}" ]; then
+		sys=$(cpulist_norm "$system_cpus")
+		for kv in ${irqs-}; do
+			f=/proc/irq/${kv%%:*}/smp_affinity_list
+			[ -r "$f" ] || continue
+			if [ "$(cpulist_norm "${kv#*:}")" != "$sys" ] &&
+				[ "$(cpulist_norm "$(cat "$f")")" = "$sys" ]; then
+				moved="$moved ${kv%%:*}"
+			fi
+		done
+	fi
+	[ -z "$moved" ] || lost="$lost affinity of IRQ$moved;"
+
 	if [ -n "$lost" ]; then
 		note "warning: not back as before:$lost"
 		return 1
@@ -727,25 +1062,66 @@ do_reset() {
 	rm -f "$STATE"
 }
 
+# The highest CPU whose core does not hold CPU 0 (which runs the system
+# and cannot go offline), as the lowest-numbered CPU of that core.
 auto_select() {
-	max=$1
-	best=$max
-	sibs=$(cat "/sys/devices/system/cpu/cpu$max/topology/thread_siblings_list" 2>/dev/null || echo "$max")
-	for s in $(expand_cpulist "$sibs"); do
-		if [ "$s" -lt "$best" ]; then
-			best=$s
+	c=$1
+	while [ "$c" -gt 0 ]; do
+		sibs=$(cat "/sys/devices/system/cpu/cpu$c/topology/thread_siblings_list" 2>/dev/null || echo "$c")
+		if ! cpulist_has "$sibs" 0; then
+			best=$c
+			for s in $(expand_cpulist "$sibs"); do
+				[ "$s" -ge "$best" ] || best=$s
+			done
+			echo "$best"
+			return 0
 		fi
+		c=$((c - 1))
 	done
-	if [ "$best" = 0 ]; then
-		die "the auto-selected core is core 0, which cannot be isolated; run tune by hand with another CPU (see tune -h), or use a machine with more cores"
-	fi
-	echo "$best"
+	die "every CPU here belongs to core 0, which runs the system and cannot be isolated; tuning needs a machine with two cores or more"
+}
+
+# Waits for a package update that is running to finish, so that no
+# library changes between the runs. A running update is "activating"
+# (a oneshot service), which is-active --quiet counts as not running.
+wait_for_updates() {
+	for u in $UPDATERS; do
+		waited=0
+		while :; do
+			case "$(systemctl is-active "$u" 2>/dev/null || true)" in
+			active | activating | deactivating | reloading) ;;
+			*) break ;;
+			esac
+			[ "$waited" -gt 0 ] ||
+				note "waiting for $u to finish updating packages (up to 30 min)"
+			[ "$waited" -lt 1800 ] ||
+				die "$u is still updating packages after 30 min; tune again once it has finished"
+			sleep 5
+			waited=$((waited + 5))
+		done
+	done
+}
+
+# swapoff pages everything in swap back into memory; with too little
+# free, the kernel kills programs (it once took down every session on
+# the laptop). A margin of a tenth of the memory stays free.
+check_swap_fits() {
+	used=$(awk 'NR > 1 { s += $4 } END { print s + 0 }' /proc/swaps)
+	[ "$used" -gt 0 ] || return 0
+	avail=$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo 2>/dev/null || true)
+	total=$(awk '$1 == "MemTotal:" { print $2 }' /proc/meminfo 2>/dev/null || true)
+	avail=${avail:-0}
+	need=$((used + ${total:-0} / 10))
+	[ "$avail" -ge "$need" ] ||
+		die "swap holds $((used / 1024)) MB; turning it off needs that much free memory and a margin, $((need / 1024)) MB in all, but only $((avail / 1024)) MB is free. Close some programs, then tune again."
 }
 
 trap on_exit EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
+if [ "${1:-}" != reset ]; then
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+fi
 # Output piped into a program that has ended (tee after Ctrl-C) would
 # kill this script at its next message, before it could undo anything.
 # Ignored, the message just fails.
@@ -767,6 +1143,7 @@ check)
 reset)
 	[ $# -eq 1 ] || usage
 	[ "$(id -u)" = 0 ] || die_cmd "must run as root" "sudo $0 $ARGS"
+	take_lock
 	do_reset || die_cmd "the system is not restored in full" \
 		"sudo $0 reset" \
 		"If something cannot come back, give up on it with:
@@ -795,6 +1172,7 @@ if [ $# -eq 1 ]; then
 fi
 
 preflight
+take_lock
 
 MAX=$(cpu_max)
 [ "$MAX" -gt 0 ] || die "only one CPU present, nothing to isolate"
@@ -824,6 +1202,22 @@ else
 	BENCH=$(auto_select "$MAX")
 	AUTO=", auto-selected"
 fi
+SIBS=$(cat "/sys/devices/system/cpu/cpu$BENCH/topology/thread_siblings_list" 2>/dev/null || echo "$BENCH")
+if cpulist_has "$SIBS" 0; then
+	die "cpu $BENCH shares its core with cpu 0, which runs the system and cannot go offline"
+fi
+# the CPUs left to the system: all but the measured core's
+REMAINING=
+i=0
+while [ "$i" -le "$MAX" ]; do
+	cpulist_has "$SIBS" "$i" || REMAINING="$REMAINING${REMAINING:+,}$i"
+	i=$((i + 1))
+done
+[ -n "$REMAINING" ] || die "no CPUs left to host the system"
+
+wait_for_updates
+check_swap_fits
+SLICES=$(saved_slices)
 
 # radios that are on now, and the swap in use, to restore exactly those
 # (an rfkill too old for -o gives unknown: reset then unblocks all)
@@ -853,7 +1247,7 @@ fi
 	echo "radio_types='$radio_types'"
 	echo "radio_states='$radio_states'"
 	echo "swaps='$(awk 'NR > 1 { printf "%s:%s ", $1, $5 }' /proc/swaps)'"
-	echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+	echo "governors='$(saved_governors)'"
 	echo "turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo unknown)"
 	echo "boost=$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null || echo unknown)"
 	echo "samplerate=$(cat /proc/sys/kernel/perf_event_max_sample_rate 2>/dev/null || echo unknown)"
@@ -863,15 +1257,50 @@ fi
 	echo "freqs='$(saved_freqs)'"
 	echo "epps='$(saved_epps)'"
 	echo "irqs='$(saved_irqs)'"
-	# appended to below for each service stopped
+	# printf: a unit name may have a backslash (\x2d), which echo may
+	# take as an escape
+	printf "slices='%s'\n" "$SLICES"
+	# what the IRQs are moved to, to tell at reset one that was not
+	# moved back
+	echo "system_cpus='$REMAINING'"
+	# set to 1 below when systemd-rfkill is masked
+	echo "rfkill_masked=0"
+	# appended to below for each service or timer stopped
 	echo "stopped=''"
+	# appended to below for each WireGuard link taken down
+	echo "wireguard=''"
 } > "$STATE.new"
 # in one step, so that reset never reads half a file
 mv "$STATE.new" "$STATE"
 ARMED=1
 
-# nothing to guard if no radio is on
-if [ -n "$radios" ]; then
+# Swap off before the radios: if it takes long or fails, a machine
+# reached over Wi-Fi is still reachable meanwhile.
+used=$(awk 'NR > 1 { s += $4 } END { print s + 0 }' /proc/swaps)
+if [ "$used" -gt 0 ]; then
+	note "turning swap off (${used} KiB in use; this blocks until it is paged back in)"
+fi
+swapoff -a || die "swapoff failed"
+[ "$(swap_kb)" = 0 ] || die "swap still in use after swapoff"
+
+# The WireGuard links to take down after the radios (see
+# wireguard_links), and the commands that bring them back, for the
+# guard's timer
+links=$(wireguard_links)
+WG_UP=
+for k in $links; do
+	l=${k#*:}
+	l=${l%%:*}
+	case $k in
+	other:*) note "warning: WireGuard link $l is run by none of wg-quick, NetworkManager and systemd-networkd, so it stays up; its work can run on CPU $BENCH" ;;
+	# retried for a minute: the radios come back in the same breath,
+	# and wg-quick cannot look up its peers before the network is up
+	*) WG_UP="${WG_UP}for i in 1 2 3 4 5 6 7 8 9 10 11 12; do $(wireguard_cmd "$k" up) && break; sleep 5; done; " ;;
+	esac
+done
+
+# nothing to guard if no radio is on and no link goes down
+if [ -n "$radios" ] || [ -n "$WG_UP" ]; then
 	guard_radios
 fi
 # Each radio by its id, not "all": that would also make the kernel block
@@ -891,17 +1320,35 @@ else
 	echo "radios_off='$(rfkill -n -o ID,SOFT | awk '$2 == "blocked" { printf "%s ", $1 }')'" >>"$STATE"
 fi
 
+# WireGuard down, after the radios: with them off its links carry
+# nothing anyway. The guard's timer brings them back with the radios.
+# Each is written down before it goes down.
+WG_DOWN=
+wireguard=
+for k in $links; do
+	case $k in other:*) continue ;; esac
+	l=${k#*:}
+	l=${l%%:*}
+	wireguard="$wireguard $k"
+	echo "wireguard='$wireguard'" >>"$STATE"
+	$(wireguard_cmd "$k" down) >/dev/null 2>&1 || die "could not take WireGuard link $l down"
+	! wireguard_is_up "$l" || die "WireGuard link $l is still up after taking it down"
+	WG_DOWN="$WG_DOWN${WG_DOWN:+, }$l"
+done
+
+# Each write is judged by its result: for root "[ -w file ]" is true
+# even for a file the kernel will refuse.
 for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-	[ -w "$f" ] || continue
+	[ -e "$f" ] || continue
 	set_verify "$f" performance
 done
 # Turbo off before the ceiling is read below, so the clock is pinned at
 # the highest non-boost frequency: the only one the vendor guarantees
 # can be sustained; thermal or power limits may drop a boost one mid-run.
 # intel_pstate has no_turbo, acpi-cpufreq and amd-pstate cpufreq/boost.
-if [ -w /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+if [ -e /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
 	set_verify /sys/devices/system/cpu/intel_pstate/no_turbo 1
-elif [ -w /sys/devices/system/cpu/cpufreq/boost ]; then
+elif [ -e /sys/devices/system/cpu/cpufreq/boost ]; then
 	set_verify /sys/devices/system/cpu/cpufreq/boost 0
 else
 	note "warning: no turbo/boost knob found; the pinned clock below may be one the CPU cannot sustain"
@@ -911,7 +1358,7 @@ fi
 # scaling_min_freq to the maximum pins the clock, so a perf cycle sample
 # is worth the same time at the end of a recording as at the start.
 for d in /sys/devices/system/cpu/cpu*/cpufreq; do
-	[ -w "$d/scaling_min_freq" ] || continue
+	[ -e "$d/scaling_min_freq" ] || continue
 	maxf=$(cat "$d/scaling_max_freq")
 	set_verify "$d/scaling_min_freq" "$maxf"
 done
@@ -925,52 +1372,35 @@ else
 	OFF="radios and swap"
 fi
 
-used=$(awk 'NR > 1 { s += $4 } END { print s + 0 }' /proc/swaps)
-if [ "$used" -gt 0 ]; then
-	note "turning swap off (${used} KiB in use; this blocks until it is paged back in)"
-fi
-swapoff -a || die "swapoff failed"
-[ "$(swap_kb)" = 0 ] || die "swap still in use after swapoff"
-
-# only those running, so reset starts exactly those again; cron's unit
-# is cron on Debian and Ubuntu, crond on Fedora, cronie on Arch
+# Only those running, so reset starts exactly those again; cron's unit
+# is cron on Debian and Ubuntu, crond on Fedora, cronie on Arch. Each
+# is written down before it is stopped: a signal during the stop would
+# otherwise leave it stopped after the rollback.
 STOPPED=
+PAUSED=
 stopped=
-for svc in irqbalance cron crond cronie unattended-upgrades; do
-	if systemctl is-active --quiet "$svc" 2>/dev/null; then
-		systemctl stop "$svc" || die "could not stop $svc"
-		STOPPED="$STOPPED${STOPPED:+, }$svc"
-		stopped="$stopped $svc"
-		echo "stopped='$stopped'" >>"$STATE"
-	fi
+for u in irqbalance cron crond cronie $(printf '%s.timer ' $TIMERS); do
+	systemctl is-active --quiet "$u" 2>/dev/null || continue
+	stopped="$stopped $u"
+	echo "stopped='$stopped'" >>"$STATE"
+	systemctl stop "$u" || die "could not stop $u"
+	case "$u" in
+	*.timer) PAUSED="$PAUSED${PAUSED:+, }${u%.timer}" ;;
+	*) STOPPED="$STOPPED${STOPPED:+, }$u" ;;
+	esac
 done
 
 # SMT sibling(s) offline only after the governor pass above: taking a
 # CPU down first makes later cpufreq writes fail (observed: "echo: I/O
 # error").
 OFFLINED=
-siblist=$(cat "/sys/devices/system/cpu/cpu$BENCH/topology/thread_siblings_list" 2>/dev/null || echo "$BENCH")
-for s in $(expand_cpulist "$siblist"); do
+for s in $(expand_cpulist "$SIBS"); do
 	if [ "$s" = "$BENCH" ]; then
 		continue
 	fi
 	set_verify "/sys/devices/system/cpu/cpu$s/online" 0
 	OFFLINED="$OFFLINED${OFFLINED:+, }$s"
 done
-
-REMAINING=""
-i=0
-while [ "$i" -le "$MAX" ]; do
-	if [ "$i" != "$BENCH" ]; then
-		f="/sys/devices/system/cpu/cpu$i/online"
-		if [ "$i" = 0 ] || { [ -f "$f" ] && [ "$(cat "$f")" = 1 ]; }; then
-			REMAINING="$REMAINING,$i"
-		fi
-	fi
-	i=$((i + 1))
-done
-REMAINING=${REMAINING#,}
-[ -n "$REMAINING" ] || die "no CPUs left to host the system"
 
 moved=0
 for f in /proc/irq/[0-9]*/smp_affinity_list; do
@@ -979,39 +1409,49 @@ done
 [ "$moved" -gt 0 ] || die "could not steer any IRQ away from CPU $BENCH"
 # per-IRQ affinity only covers IRQs that exist now; default_smp_affinity
 # governs any registered from here on
-if [ -w /proc/irq/default_smp_affinity ]; then
+if [ -e /proc/irq/default_smp_affinity ]; then
 	mask=$(cpulist_to_mask "$REMAINING" "$MAX")
-	echo "$mask" > /proc/irq/default_smp_affinity ||
+	echo "$mask" > /proc/irq/default_smp_affinity 2>/dev/null ||
 		die "could not set default_smp_affinity to $mask"
 fi
 
 # cgroup-v2-native shielding. cset is not an option: it only speaks
-# cgroup v1, which Ubuntu dropped in 21.10.
-for u in init.scope system.slice user.slice; do
+# cgroup v1, which Ubuntu dropped in 21.10. Every top-level slice and
+# scope but tune.slice, as saved in the state file. A scope that has
+# ended meanwhile cannot be set, and needs no setting.
+for kv in $SLICES; do
+	u=${kv%%=*}
 	systemctl set-property --runtime "$u" AllowedCPUs="$REMAINING" ||
+		[ ! -d "/sys/fs/cgroup/$u" ] ||
 		die "systemctl set-property failed on $u"
 done
 
 # The isolated CPU needs a slice of its own, or nothing can run on it:
-# user.slice and system.slice were just restricted to the other CPUs.
+# every other one was just restricted to the other CPUs.
 # Programs run in it with "systemd-run --scope --slice=tune".
 systemctl set-property --runtime tune.slice AllowedCPUs="$BENCH" ||
 	die "could not create tune.slice for CPU $BENCH"
 
 # check the shielding took effect, not just that systemd accepted it
 want=$(cpulist_norm "$REMAINING")
-for c in system.slice user.slice; do
-	f="/sys/fs/cgroup/$c/cpuset.cpus.effective"
+for kv in $SLICES; do
+	u=${kv%%=*}
+	f="/sys/fs/cgroup/$u/cpuset.cpus.effective"
+	[ -d "/sys/fs/cgroup/$u" ] || continue
 	[ -r "$f" ] || die "cannot read $f to verify shielding"
 	got=$(cpulist_norm "$(cat "$f")")
 	[ "$got" = "$want" ] ||
-		die "shielding did not take effect: $c has cpus '$(cat "$f")', expected '$REMAINING'"
+		die "shielding did not take effect: $u has cpus '$(cat "$f")', expected '$REMAINING'"
 done
+# cgroups that are no systemd unit (made by hand, or by a container
+# engine), or slices made since the state file was written
+others=$(cgroups_on "$BENCH")
+[ -z "$others" ] || note "warning: these cgroups can still run on CPU $BENCH: $others"
 
 # The rest of what pyperf's "system tune" does (governor, turbo, IRQ
 # affinity) is done above; it also drops perf_event_max_sample_rate to
 # 1, which would throttle perf record, so the rate is raised instead.
-if [ -w /proc/sys/kernel/perf_event_max_sample_rate ]; then
+if [ -e /proc/sys/kernel/perf_event_max_sample_rate ]; then
 	# The kernel lowers the ceiling by itself whenever perf's interrupts
 	# exceed its CPU time limit, as they do at a low clock ("perf:
 	# interrupt took too long" in the kernel log), and then drops
@@ -1021,10 +1461,11 @@ if [ -w /proc/sys/kernel/perf_event_max_sample_rate ]; then
 	# the pair is retried.
 	rate=/proc/sys/kernel/perf_event_max_sample_rate
 	limit=/proc/sys/kernel/perf_cpu_time_max_percent
-	[ -w "$limit" ] || die "cannot write $limit, so perf would get throttled at this clock"
 	try=0
 	while :; do
-		echo 25 >"$limit" && echo "$SAMPLE_RATE" >"$rate" && echo 0 >"$limit" ||
+		echo 25 >"$limit" 2>/dev/null ||
+			die "cannot write $limit, so perf would get throttled at this clock"
+		echo "$SAMPLE_RATE" >"$rate" 2>/dev/null && echo 0 >"$limit" 2>/dev/null ||
 			die "cannot write $rate and $limit"
 		[ "$(cat "$rate")" = "$SAMPLE_RATE" ] && break
 		try=$((try + 1))
@@ -1032,14 +1473,13 @@ if [ -w /proc/sys/kernel/perf_event_max_sample_rate ]; then
 	done
 	[ "$(cat "$limit")" = 0 ] || die "$limit reads back as '$(cat "$limit")', expected '0'"
 else
-	note "warning: perf_event_max_sample_rate not writable; left as-is"
+	note "warning: perf_event_max_sample_rate not found; left as-is"
 fi
 
-# nohz_full is suggested only where it can be used: not with
-# intel_pstate (preflight refuses that pair), and not on a kernel built
-# without it (no nohz_full file)
+# suggested where the kernel has it: one built with CONFIG_NO_HZ_FULL
+# has the nohz_full file
 params="isolcpus rcu_nocbs"
-if [ ! -d /sys/devices/system/cpu/intel_pstate ] && [ -e /sys/devices/system/cpu/nohz_full ]; then
+if [ -e /sys/devices/system/cpu/nohz_full ]; then
 	params="$params nohz_full"
 fi
 missing=
@@ -1052,16 +1492,26 @@ case "$PINNED" in
 *) clock="$((PINNED / 1000)) MHz" ;;
 esac
 note "isolated CPU $BENCH$AUTO (${OFFLINED:+SMT sibling $OFFLINED offline, }$moved IRQs moved off it), clock pinned at $clock"
-note "until restored: $OFF are off${STOPPED:+; $STOPPED stopped}"
-if [ -n "$radios" ]; then
+note "until restored: $OFF are off${WG_DOWN:+; WireGuard down: $WG_DOWN}${STOPPED:+; $STOPPED stopped}${PAUSED:+; timers paused: $PAUSED}"
+if [ -n "$radios" ] && [ -n "$WG_DOWN" ]; then
+	note "the radios and WireGuard come back on by themselves at $RADIOS_BACK, if not restored before"
+elif [ -n "$radios" ]; then
 	note "the radios come back on by themselves at $RADIOS_BACK, if not restored before"
+elif [ -n "$WG_DOWN" ]; then
+	note "WireGuard comes back on by itself at $RADIOS_BACK, if not restored before"
+fi
+# A Raspberry Pi's firmware lowers the clock by itself on under-voltage
+# or heat, whatever the pinned clock.
+thr=$(firmware_throttled)
+if [ -n "$thr" ]; then
+	if [ $(($thr & 0xf)) -ne 0 ]; then
+		note "warning: the firmware is holding the clock down now (vcgencmd get_throttled: $thr; under-voltage or heat)"
+	elif [ $(($thr & 0xf0000)) -ne 0 ]; then
+		note "warning: the firmware has held the clock down since boot (vcgencmd get_throttled: $thr; under-voltage or heat); it may do so during the runs"
+	fi
 fi
 if [ -n "$missing" ]; then
-	if [ -d /sys/devices/system/cpu/intel_pstate ]; then
-		note "for full isolation, also boot with$missing (nohz_full is left out: with intel_pstate it makes the clock unstable)"
-	else
-		note "for full isolation, also boot with$missing"
-	fi
+	note "for full isolation, also boot with$missing"
 fi
 
 if [ "$HOLD" = 1 ]; then
@@ -1081,5 +1531,7 @@ if [ "$HOLD" = 1 ]; then
 	done
 fi
 
-ARMED=0
+# the CPU, before disarming: if it cannot be printed, keep fails, and so
+# rolls back rather than leaving a tuning nobody was told of
 echo "$BENCH"
+ARMED=0

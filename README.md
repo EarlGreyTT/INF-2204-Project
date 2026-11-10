@@ -29,18 +29,21 @@ export nick=
 In this folder, with a laptop on its charger:
 
 ```sh
-sudo scripts/measure -n "$nick" all
+sudo scripts/measure -n "$nick" -r 10 all
 ```
 
 This builds the programs, downloads their inputs (1.5 GB; `build/`
 takes about 12 GB of disk) and measures each workload in
 `workloads.txt`. The compile workloads need our own compilers,
 `build/cc1` and `build/clang`: the first run builds them, which takes
-hours on a Raspberry Pi. First come the time runs of every workload,
+hours on a Raspberry Pi. On a Raspberry Pi the counts also need our
+own valgrind, `build/valgrind`, with a fix for arm64; the first run
+builds that too. First come the time runs of every workload,
 then one count of each (callgrind, several at a time; on a Raspberry
 Pi this part takes the better part of a day). Wi-Fi and Bluetooth are
 off during the time runs: over ssh on Wi-Fi, run it inside `screen`.
-If it stops early, it prints the commands that do what is left.
+If it stops early, run the same command again: it measures only what
+is left.
 Results go to `measurements/<workload>/`.
 
 The four slowest counts (gcc and clang building git and Neovim, hours
@@ -48,26 +51,26 @@ each) come last: you can stop `measure` then (Ctrl-C) and keep
 everything else. To leave them out from the start:
 
 ```sh
-sudo scripts/measure -n "$nick" -s all
+sudo scripts/measure -n "$nick" -r 10 -s all
 ```
 
 ## After a git pull
 
 `make` rebuilds a program whenever the Makefile has changed. For
 `build/cc1` and `build/clang` that takes hours on a Raspberry Pi. If
-the change did not touch how they are built (it says so in its
-description), mark them as up to date instead (`-c`: only those you
-have built):
+the change did not touch how the programs are built (it says so in its
+description), mark them all as up to date instead, in one command (`-c`:
+only those you have built):
 
 ```sh
-touch -c build/cc1 build/clang build/git build/neovim-deps/done
+touch -c build/zlib/lib/libz.a build/zstd build/xz build/speedtest1 build/magick build/git build/cc1 build/clang build/neovim-deps/done build/repo build/compile/sqlite build/compile/*.tar
 ```
 
 ## Cleaner measurements
 
 `tune` prints kernel boot options that keep other work off the
 measured CPU, e.g. `tune: for full isolation, also boot with isolcpus=3
-rcu_nocbs=3`. Add them, then reboot:
+rcu_nocbs=3 nohz_full=3` (nohz_full only where the kernel has it). Add them, then reboot:
 
 - Ubuntu: inside the quotes of `GRUB_CMDLINE_LINUX_DEFAULT` in
   `/etc/default/grub`, then run `sudo update-grub`.
