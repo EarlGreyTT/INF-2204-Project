@@ -29,13 +29,13 @@ def main():
         print("Error: No input file\nUsage: python3 graphing.py <path>", file=sys.stderr)
         return
 
-    unit = " (" + sys.argv[2].split("/")[-2] + ")"
+    unit = " (" + sys.argv[1].split("/")[-2] + ")"
     if unit == "count":
         unit = None
-
+        
     header = None
     all_data = []
-    for i in range(2, len(sys.argv)):
+    for i in range(1, len(sys.argv)):
         path = sys.argv[i]
         try:
             with open(path, 'r') as f:
@@ -62,7 +62,11 @@ def main():
         i += 3
 
     plt.xlabel(header[0])
-    plt.ylabel(header[1] + unit)
+    if unit:
+        plt.ylabel(header[1] + unit)
+    else:
+        plt.ylabel(header[1])
+
     plt.legend(fontsize=FONTSIZE)
     plt.show()
 
