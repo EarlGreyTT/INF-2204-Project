@@ -1448,7 +1448,15 @@ count_processes() {
 	left=$(pgrep -g "$VG_GROUP" -d ' ' || true)
 	kill -s TERM -- "-$VG_GROUP" 2>/dev/null || true
 	VG_GROUP=
-	[ -z "$left" ] || die "the command ended, but processes it started still ran ($left); they were stopped"
+	# Summing that failed stops the command, whose processes may still be
+	# ending here: then rank's error is the cause. rank writes it before
+	# the stop.
+	if [ -n "$left" ] && grep -q '^rank: error: ' "$STAGE/collect.log"; then
+		die "summing the counts failed$(memory_note), so the command was stopped: $(sed -n 's/^rank: error: //p' "$STAGE/collect.log")"
+	fi
+	# memory_note: rank itself can be killed for lack of memory, without
+	# a word
+	[ -z "$left" ] || die "the command ended, but processes it started still ran ($left); they were stopped$(memory_note)"
 	touch "$CG/finished"
 	wait "$COLLECTOR" || true
 	COLLECTOR=

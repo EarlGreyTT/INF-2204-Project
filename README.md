@@ -66,6 +66,10 @@ only those you have built):
 touch -c build/zlib/lib/libz.a build/zstd build/xz build/speedtest1 build/magick build/git build/cc1 build/clang build/neovim-deps/done build/repo build/compile/sqlite build/compile/*.tar
 ```
 
+A compile workload can still refuse an old `build/compile/*.tar` ("made
+with other settings"), for example after a change to
+`scripts/workloads/compile`. It then prints the command that remakes it.
+
 ## Cleaner measurements
 
 `tune` prints kernel boot options that keep other work off the

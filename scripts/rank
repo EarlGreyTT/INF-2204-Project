@@ -118,12 +118,29 @@ LEVELS = ("instructions", "lines", "functions")
 ENV = {k: v for k, v in os.environ.items() if k != "DEBUGINFOD_URLS"} | {"LC_ALL": "C"}
 
 
+def failed(what, status, err):
+    """Stops for a helper program that failed: with its error output,
+    or the signal that ended it."""
+    if status == -signal.SIGKILL:
+        die(f"{what} was killed by SIGKILL (the kernel does that when memory runs out)")
+    if status < 0:
+        die(f"{what} was killed by {signal.Signals(-status).name}")
+    die(f"{what} failed: {err.strip()}")
+
+
 def run(*cmd, input=None):
-    try:
-        return subprocess.run(cmd, input=input, capture_output=True, text=True,
-                              check=True, env=ENV).stdout
-    except subprocess.CalledProcessError as e:
-        die(f"{' '.join(map(os.fsdecode, cmd[:2]))} failed: {e.stderr.strip()}")
+    # input from a file, not a pipe: if the helper is killed (for lack
+    # of memory: addr2line on clang takes gigabytes), writing to the
+    # pipe raises SIGPIPE, which ends rank without a word (see the end)
+    with tempfile.TemporaryFile("w+") as inp:
+        if input is not None:
+            inp.write(input)
+            inp.seek(0)
+        r = subprocess.run(cmd, stdin=inp if input is not None else None,
+                           capture_output=True, text=True, env=ENV)
+    if r.returncode:
+        failed(" ".join(map(os.fsdecode, cmd[:2])), r.returncode, r.stderr)
+    return r.stdout
 
 
 # -- time (perf) --
@@ -740,7 +757,7 @@ class Code:
                 jump_to.append(int(j[1], 16))
         if dump.wait():
             errs.seek(0)
-            die(f"objdump -d {path} failed: {errs.read().strip()}")
+            failed(f"objdump -d {path}", dump.returncode, errs.read())
         errs.close()
         order = np.argsort(np.frombuffer(addrs, dtype=np.uint64), kind="stable")
         self.addrs = np.frombuffer(addrs, dtype=np.uint64)[order]
@@ -1080,7 +1097,7 @@ def source_places(path, addresses):
             frames = read_frames(dump.stdout, path, one)
             if dump.wait():
                 err.seek(0)
-                die(f"addr2line failed: {err.read().strip()}")
+                failed("addr2line", dump.returncode, err.read())
     if set(frames) != set(addresses):
         die(f"addr2line gave {len(frames)} of {len(addresses)} addresses in {path}")
     table, places = symbols(path), {}
@@ -1196,7 +1213,7 @@ def entry_points(path, ran):
                     cols[at][i] = int(l.split()[-1], 0)
     if dump.wait():
         errs.seek(0)
-        die(f"objdump --dwarf=info {path} failed: {errs.read().strip()}")
+        failed(f"objdump --dwarf=info {path}", dump.returncode, errs.read())
     errs.close()
     del ids
     if not node:
