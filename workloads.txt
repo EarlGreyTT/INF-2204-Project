@@ -22,6 +22,7 @@ imagemagick-resize   -q                            build/magick build/bridge.ppm
 imagemagick-resize-deer -q                         build/magick build/deer.ppm -resize 50% -unsharp 0x1 ppm:-
 imagemagick-resize-big-tree -q                     build/magick build/big_tree.ppm -resize 50% -unsharp 0x1 ppm:-
 imagemagick-resize-artificial -q                   build/magick build/artificial.ppm -resize 50% -unsharp 0x1 ppm:-
+imagemagick-resize-leaves -q                       build/magick build/leaves_iso_1600.ppm -resize 50% -unsharp 0x1 ppm:-
 zstd-19-git          -q                            build/zstd -19 -c build/tars/git.tar
 zstd-19-lua          -q                            build/zstd -19 -c build/tars/lua.tar
 zstd-19-sqlite       -q                            build/zstd -19 -c build/tars/sqlite.tar

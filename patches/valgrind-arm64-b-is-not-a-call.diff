@@ -1,0 +1,24 @@
+Made with Claude Code, Anthropic's AI coding assistant.
+
+valgrind's arm64 decoder (VEX) marks every plain branch, B, as a call,
+like BL. Callgrind then pushes a call-stack frame for each loop jump and
+tail call that never returns, and its call stack grows without end: the
+long counts on a Raspberry Pi ran out of memory. 32-bit ARM does it
+right. Tested on valgrind 3.24.0 and 3.28.0 on a Raspberry Pi 5: the
+programs' own instruction counts unchanged (xz and zstd), call stack
+normal again.
+
+--- a/VEX/priv/guest_arm64_toIR.c
++++ b/VEX/priv/guest_arm64_toIR.c
+@@ -7432,7 +7432,10 @@
+       }
+       putPC(mkU64(guest_PC_curr_instr + simm64));
+       dres->whatNext = Dis_StopHere;
+-      dres->jk_StopHere = Ijk_Call;
++      /* Only BL is a call: a plain B is a jump (as on 32-bit ARM). As
++         Ijk_Call, callgrind took every B (loops, tail calls) for a call
++         and its call stack grew without end. */
++      dres->jk_StopHere = bLink ? Ijk_Call : Ijk_Boring;
+       DIP("b%s 0x%llx\n", bLink == 1 ? "l" : "",
+                           guest_PC_curr_instr + simm64);
+       return True;

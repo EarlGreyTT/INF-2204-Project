@@ -4,7 +4,6 @@ perf.data*
 perf.zip
 
 measurements-all/
-scripts/share
 
 # compiled programs (make), and LaTeX build output
 build/
