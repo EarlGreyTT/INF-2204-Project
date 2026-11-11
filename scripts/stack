@@ -13,6 +13,7 @@ Usage:
   -d <dots>     dots across, 50 to 2000 (1500 with -p); default 1000 (400)
   -o <image>    save instead of showing; without -p, a 4K dark picture;
                 .svg: transparent, text black or white to match light/dark
+                (with -p: plain black text, for LaTeX)
   <list.csv>    ranked lists from rank; one kind (time or count) per picture
 
   For example, xz-6-lua's time runs as a figure for the paper:
@@ -54,7 +55,8 @@ FIX_LIST = "make the list with scripts/rank"
 
 
 # SVG ink is black, white in dark mode; the halo keeps it readable on a
-# page of the other colour.
+# page of the other colour. The white halo is also an attribute: Inkscape
+# (svg in LaTeX) ignores the CSS rule and would draw it black.
 LIGHT_DARK = """<style>
 svg { color-scheme: light dark; color: #000 }
 #figure_1 { filter: url(#halo) }
@@ -70,7 +72,7 @@ svg { color-scheme: light dark; color: #000 }
   <feColorMatrix in="SourceGraphic" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  10 10 10 1 -30" result="white"/>
   <feMerge><feMergeNode in="black"/><feMergeNode in="white"/></feMerge>
   <feMorphology operator="dilate" radius="0.7" result="wide"/>
-  <feFlood/>
+  <feFlood flood-color="#fff"/>
   <feComposite in2="wide" operator="in"/>
   <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
 </filter>
@@ -195,7 +197,7 @@ def main():
     dots = args.dots if args.dots is not None else '400' if args.paper else '1000'
     # More dots than the plot has pixels leaves gaps in the lines.
     most = 1500 if args.paper else 2000
-    if not (dots.isdigit() and 50 <= int(dots) <= most):
+    if not (dots.isascii() and dots.isdigit() and 50 <= int(dots) <= most):
         die(f"-d {dots}: give 50 to {most} dots across")
     dots = int(dots)
     if args.image:
@@ -213,11 +215,13 @@ def main():
         print(f"stack: reading {len(args.lists)} lists", file=sys.stderr)
     lists = [read_list(path) for path in args.lists]
     # Each workload on each platform counts once, however many runs it
-    # has: <workload>/<time|count>/<platform>.run<N>.<file>
+    # has: <workload>/<time|count>/<platform>.run<N>.<file>; a time list
+    # and a count list, or a run's line and instruction lists, are
+    # different series
     def series(path):
         parts = os.path.abspath(path).split(os.sep)
-        name = re.match(r'(.+)\.run[0-9]+\.', parts[-1])
-        return (parts[-3], name.group(1)) if name and len(parts) >= 3 else path
+        name = re.match(r'(.+)\.run[0-9]+\.(.+)', parts[-1])
+        return (parts[-3], parts[-2], name.group(1), name.group(2)) if name and len(parts) >= 3 else path
     groups = [series(path) for path in args.lists]
     runs = {g: groups.count(g) for g in set(groups)}
     weights = [1 / runs[g] for g in groups]
@@ -270,11 +274,18 @@ def main():
         bar_label = 'how many series pass here (per column)'
 
     svg = bool(args.image) and args.image.lower().endswith('.svg')
+    # light/dark only on screen: the halo filter makes renderers other
+    # than browsers (Inkscape, rsvg, so LaTeX) turn the whole picture
+    # into one bitmap; a paper page is white anyway
+    adaptive = svg and not args.paper
+    style = [style]
     if svg:
-        style = [style, {'svg.fonttype': 'none', 'text.color': INK,
-                         'axes.labelcolor': INK, 'axes.edgecolor': INK,
-                         'xtick.color': INK, 'ytick.color': INK,
-                         'legend.facecolor': 'none'}]
+        style.append({'svg.fonttype': 'none'})
+    if adaptive:
+        style.append({'text.color': INK,
+                      'axes.labelcolor': INK, 'axes.edgecolor': INK,
+                      'xtick.color': INK, 'ytick.color': INK,
+                      'legend.facecolor': 'none'})
 
     with plt.style.context(style):
         fig, ax = plt.subplots(figsize=size, layout='constrained')
@@ -314,11 +325,11 @@ def main():
         if args.image:
             try:
                 fig.savefig(args.image, dpi=dpi, transparent=svg)
-                if svg:
-                    with open(args.image) as f:
+                if adaptive:
+                    with open(args.image, encoding='utf-8') as f:
                         text = f.read().replace(INK, 'currentColor')
                     end = text.index('>', text.index('<svg')) + 1
-                    with open(args.image, 'w') as f:
+                    with open(args.image, 'w', encoding='utf-8') as f:
                         f.write(text[:end] + LIGHT_DARK + text[end:])
             except (OSError, ValueError) as error:
                 die(f"{args.image}: cannot save: {getattr(error, 'strerror', None) or error}")
