@@ -261,9 +261,27 @@ def main():
     if args.paper:
         cmap = ListedColormap(viridis(np.linspace(0.6, 0, 256)))
         # pdf.fonttype 42: real fonts in the PDF, as paper checks want
-        style = {'font.size': 8, 'pdf.fonttype': 42, 'axes.linewidth': 0.6,
-                 'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
-                 'xtick.minor.width': 0.4, 'ytick.minor.width': 0.4}
+        style = {
+            # Times New Roman (falls back to the metrically-compatible clones)
+            'font.family': 'serif',
+            'font.serif': ['Times New Roman', 'Times', 'Nimbus Roman',
+                        'TeX Gyre Termes', 'Liberation Serif', 'DejaVu Serif'],
+            'mathtext.fontset': 'stix',          # math matches Times
+            'pdf.fonttype': 42,                  # real fonts in the PDF
+            'ps.fonttype': 42,
+
+            # sizes: ~10 pt body text in IEEE
+            'font.size': 9,
+            'axes.labelsize': 9,
+            'axes.titlesize': 9,
+            'xtick.labelsize': 8,
+            'ytick.labelsize': 8,
+            'legend.fontsize': 8,
+
+            'axes.linewidth': 0.6,
+            'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
+            'xtick.minor.width': 0.4, 'ytick.minor.width': 0.4,
+        }
         size, dpi = (3.5, 2.3), 600
         bar_label = 'series passing (per column)'
     else:
