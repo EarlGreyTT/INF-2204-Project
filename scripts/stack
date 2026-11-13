@@ -283,7 +283,7 @@ def main():
             'xtick.minor.width': 0.4, 'ytick.minor.width': 0.4,
         }
         size, dpi = (3.5, 2.3), 600
-        bar_label = 'series passing (per column)'
+        bar_label = 'Number of curves (per column)'
     else:
         cmap = ListedColormap(viridis(np.linspace(0.3, 1, 256)))
         style = 'dark_background'
@@ -324,8 +324,8 @@ def main():
         ax.yaxis.set_major_formatter(FuncFormatter(percent))
         ax.xaxis.set_minor_formatter(NullFormatter())
         ax.yaxis.set_minor_formatter(NullFormatter())
-        ax.set_xlabel('rank (1 = the most)')
-        ax.set_ylabel('share of the total (%)')
+        ax.set_xlabel('Rank')
+        ax.set_ylabel('Share of a programs total instructions (%)')
         if args.title or not args.paper:
             k = len(lists)
             ax.set_title(args.title or f"{k} ranked list{'s' if k > 1 else ''} stacked")
