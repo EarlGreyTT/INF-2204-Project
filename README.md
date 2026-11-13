@@ -111,8 +111,11 @@ shows the rest.
 - `graphing <list.csv>`: plots a list in a window.
 - `average_total_samples`: averages samples per instruction of each run into one .csv file. insignificant. 
 - `merge_samples`: loops through a configed directory and averages the samples per instruction for all runs on the same machine, workload, dataset and level of granularity.
+- `fit-distributions <list.csv>`: finds which distribution a list's
+  counts follow.
 
-All are in `scripts/`. The first six show their help with `-h`.
+All are in `scripts/`. The first six and `fit-distributions` show their
+help with `-h`.
 
 ---
 
