@@ -57,7 +57,7 @@ from matplotlib.backend_bases import FigureCanvasBase
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import ListedColormap, LogNorm
 from matplotlib.font_manager import FontProperties
-from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
+from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator, NullFormatter
 
 FIX_LIST = "make the list with scripts/rank"
 
@@ -332,6 +332,14 @@ def main():
         ax.set_yscale('log')
         ax.set_xlim(10.0 ** x_lo, 10.0 ** x_hi)
         ax.set_ylim(10.0 ** y_lo, 10.0 ** y_hi)
+        # on a long axis matplotlib labels every other power of ten and
+        # then leaves out the small marks: mark every power of ten and
+        # 2, 3, ..., 9 between them on every axis, so all figures look
+        # alike and show where a value lies between the labels
+        # and a number at every power of ten too, not every other one
+        for axis in (ax.xaxis, ax.yaxis):
+            axis.set_major_locator(LogLocator(10, subs=(1.0,), numticks=1000))
+            axis.set_minor_locator(LogLocator(10, subs=np.arange(1, 10), numticks=1000))
         # every label a power of ten: one look for 1 and for 100,000
         ax.xaxis.set_minor_formatter(NullFormatter())
         ax.yaxis.set_minor_formatter(NullFormatter())
