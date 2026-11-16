@@ -113,9 +113,11 @@ shows the rest.
 - `merge_samples`: loops through a configed directory and averages the samples per instruction for all runs on the same machine, workload, dataset and level of granularity.
 - `fit-distributions <list.csv>`: finds which distribution a list's
   counts follow.
+- `find-concentration <list.csv>`: finds how small a share of the code that ran
+  holds 90% and 50% of a list's time or count (the 90:10 rule).
 
-All are in `scripts/`. The first six and `fit-distributions` show their
-help with `-h`.
+All are in `scripts/`. The first six, `fit-distributions` and
+`find-concentration` show their help with `-h`.
 
 ---
 
