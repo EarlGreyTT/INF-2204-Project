@@ -18,6 +18,10 @@ Usage:
                    own code; may be given more than once
   <list.csv>       ranked lists from rank (rank,count,...,file)
 
+  With FD_CHECKPOINT=<dir> in the environment, every finished fit and
+  bootstrap is saved in <dir>, and the same command run again goes on
+  where it stopped.
+
   For example, the fits alone, without bootstraps, for one count list:
 
   fit-distributions -b 0 measurements/xz-6-lua/count/t14-3.run1.counts.csv
@@ -32,20 +36,36 @@ maximum likelihood, and compares them on the same data:
   lognormal              S(x) = lognormal survival function
   stretched exponential  S(x) = e^(-(lambda x)^beta)
   exponential            S(x) = e^(-lambda x)
+  double Pareto-LN       double Pareto-lognormal (Reed & Jorgensen 2004): a
+                         lognormal body with power-law tails at both ends,
+                         x^-(alpha+1) above and x^(beta-1) below; its
+                         parameters are often poorly set by the data (very
+                         different values fit equally well), so compare it
+                         by likelihood, not by its parameter values
+  broken power law       p(x) ~ x^-a1 below the break x_b, and from x_b on
+                         x_b^(a2-a1) x^-a2 (the two meet at x_b); x_b is a
+                         whole number, at least 10 counts on each side
 
-The first four are for whole numbers. The last three are for any number
-and are made whole as p(x) = [S(x) - S(x+1)] / S(1), as in Clauset,
-Shalizi & Newman (2009) and the powerlaw package (Alstott et al. 2014).
+The power laws, Yule-Simon and the broken power law are for whole
+numbers. The others are for any number and are made whole as
+p(x) = [S(x) - S(x+1)] / S(1), as in Clauset, Shalizi & Newman (2009)
+and the powerlaw package (Alstott et al. 2014).
 
 For each distribution it prints:
   log-lik  the log-likelihood: higher fits better
   dAIC     how far behind the best it is by AIC (2 x parameters
            - 2 x log-lik: a parameter must earn its place)
   KS D     the largest gap between the data's and the distribution's
-           cumulative shares
+           cumulative shares, at the values that occur in the data
   fit p    the share of data sets drawn from the fitted distribution
            that fit it worse than the data does; below 0.1 rules the
            distribution out. Only for those within 10 of the best AIC.
+  A2       the Anderson-Darling distance: like KS D, but it adds up
+           the gaps everywhere and weighs those at the two ends most
+           (the rarely and the most executed locations), where KS D
+           sees little. For whole numbers, as in Choulakian, Lockhart &
+           Stephens (1994), over the values that occur.
+  AD p     fit p, with A2 as the measure of how badly a data set fits
 
 Then the best by AIC is compared with each of the others by likelihood
 ratio: Vuong's test, or for a nested pair (one is the other with a
@@ -53,15 +73,33 @@ parameter fixed) the chi-squared test, halved where that value is at the
 edge of the other's range (the truncated power law with lambda = 0 or
 alpha = 0). Two that the data cannot tell apart (their log-likelihood
 differences small both in spread and in sum) are reported as
-indistinguishable (Vuong 1989). The results are the same on every run,
-whatever -j.
+indistinguishable (Vuong 1989). The broken power law with a1 = a2 is the
+power law, and the double Pareto-lognormal becomes the lognormal as alpha
+and beta grow without end, but neither pair gets the chi-squared test:
+at a1 = a2 the break means nothing, and the other is a limit, not a
+fixed parameter; Vuong's test is used for both.
+
+Last, a rank-size fit that is not a distribution of the counts: the
+counts sorted from largest (rank r = 1) to smallest (r = N), fitted by
+least squares of log count on log rank, as Martinez-Mekler et al. (2009)
+did, to the discrete generalized beta (DGBD) f(r) = A (N + 1 - r)^b / r^a
+and to Zipf's f(r) = A / r^a (b = 0). R^2 says how much of the spread
+of log count each explains. It is not a likelihood, so it cannot be
+compared with the table by AIC. Every rank counts the same, so the many
+small counts at the end weigh most.
+
+The results are the same on every run, whatever -j.
 """
 
 import argparse
 import csv
+import hashlib
+import json
+import os
 import shlex
 import sys
-from concurrent.futures import ProcessPoolExecutor
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 FIX_LIST = "make the list with scripts/rank"
 
@@ -478,8 +516,319 @@ class Exponential:
         return np.minimum(np.floor(x), 2.0 ** 62).astype(np.int64)
 
 
+# ---------- two more candidates: double Pareto-lognormal, broken power law ----------
+
+LOG_SQRT_2PI = 0.5 * np.log(2 * np.pi)
+# (scipy.special, not scipy.stats: the stats functions cost 100 times more per call)
+GX4, GW4 = (np.polynomial.legendre.leggauss(4)[0] + 1) / 2, np.polynomial.legendre.leggauss(4)[1] / 2
+
+
+def _minimize(nll, starts, bounds, polish_all=False):
+    """(best point, its nll), searched within bounds (a box; outside it the
+    nll is 1e300). From each start L-BFGS-B, which is quick but can stop on
+    a ridge; then Nelder-Mead from the best, and the two again in turn until
+    neither gains 1e-6. Nelder-Mead alone (as for the old candidates) runs
+    to its 20000-step limit here: where a parameter barely matters (a tail
+    beyond the data), its simplex never shrinks."""
+    lo, hi = np.array(bounds, dtype=float).T
+
+    def f(q):
+        if not (np.all(q >= lo) and np.all(q <= hi)):
+            return 1e300
+        v = nll(q)
+        return v if np.isfinite(v) else 1e300
+
+    def lbfgs(q0):
+        return optimize.minimize(f, np.clip(q0, lo, hi), method="L-BFGS-B", bounds=list(zip(lo, hi)),
+                                 options={"maxiter": 3000, "ftol": 1e-15, "gtol": 1e-9})
+
+    def nm(q0):
+        return optimize.minimize(f, np.clip(q0, lo, hi), method="Nelder-Mead",
+                                 options={"maxfev": 4000, "xatol": 1e-7, "fatol": 1e-9})
+
+    best = None
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore"):
+        for q0 in starts:
+            r = lbfgs(q0)
+            if polish_all:
+                r2 = nm(r.x)
+                r = r2 if r2.fun < r.fun else r
+            if best is None or r.fun < best.fun:
+                best = r
+        for _ in range(10):
+            before = best.fun
+            for step in (nm, lbfgs):
+                r = step(best.x)
+                if r.fun < best.fun:
+                    best = r
+            if not best.fun < before - 1e-6:
+                break
+    return best.x, best.fun
+
+
+def _log_mills(s):
+    """log of the normal's Mills ratio R(s) = Phi_c(s) / phi(s), without
+    overflow: erfcx for s >= 0, where Phi_c would underflow; for s < 0,
+    Phi_c is near 1 and the ratio is about e^(s^2/2)"""
+    s = np.asarray(s, dtype=float)
+    out = np.empty(s.shape)
+    pos = s >= 0
+    out[pos] = np.log(special.erfcx(s[pos] / np.sqrt(2))) + 0.5 * np.log(np.pi / 2)
+    out[~pos] = special.log_ndtr(-s[~pos]) + s[~pos] ** 2 / 2 + LOG_SQRT_2PI
+    return out
+
+
+class DoubleParetoLognormal:
+    # log X = nu + tau N + E1/alpha - E2/beta, N standard normal, E1 and E2
+    # standard exponential: a normal-Laplace variable (Reed & Jorgensen 2004).
+    # With y = log x, z = (y - nu)/tau and the Mills ratio R:
+    #   density of log X  g(y) = ab/(a+b) phi(z) [R(a tau - z) + R(b tau + z)]
+    #   S(y) = Phi_c(z) + phi(z)/(a+b) [b R(a tau - z) - a R(b tau + z)]
+    #   F(y) = Phi(z)   - phi(z)/(a+b) [b R(a tau - z) - a R(b tau + z)]
+    # all in logs. R falls, so a phi(z) R(b tau + z) < a Phi_c(z): the
+    # difference loses at most log10((a+b)/b) digits (F: (a+b)/a).
+    name, params, positive = "double Pareto-LN", ("alpha", "beta", "nu", "tau"), (True, True, False, True)
+    # searched as log alpha, log beta, nu, log tau, within: alpha and beta
+    # 1e-3 to 1e3 (a tail x^-1000 is no tail); nu -1000 to 100 (the
+    # lognormal's mu runs to -130 on time lists, where its body lies far
+    # below 1); tau 0.01 to 100
+    bounds = [(np.log(1e-3), np.log(1e3)), (np.log(1e-3), np.log(1e3)), (-1000, 100), (np.log(0.01), np.log(100))]
+
+    def _terms(self, p, y):
+        a, b, nu, t = p
+        z = (y - nu) / t
+        lphi = -z ** 2 / 2 - LOG_SQRT_2PI
+        # phi(z) R(a tau - z) carries the upper tail, phi(z) R(b tau + z) the lower
+        return z, lphi + _log_mills(a * t - z), lphi + _log_mills(b * t + z)
+
+    def _logsf(self, p, y):
+        a, b = p[0], p[1]
+        z, up, low = self._terms(p, y)
+        la, lb = np.log(a / (a + b)), np.log(b / (a + b))
+        ls = special.log_ndtr(-z)
+        # the clip only catches rounding: the ratio is below a/(a+b)
+        return np.logaddexp(ls + np.log1p(-np.exp(np.minimum(la + low - ls, la))), lb + up)
+
+    def _logcdf(self, p, y):
+        a, b = p[0], p[1]
+        z, up, low = self._terms(p, y)
+        la, lb = np.log(a / (a + b)), np.log(b / (a + b))
+        lc = special.log_ndtr(z)
+        return np.logaddexp(lc + np.log1p(-np.exp(np.minimum(lb + up - lc, lb))), la + low)
+
+    def _logg(self, p, y):
+        a, b = p[0], p[1]
+        _, up, low = self._terms(p, y)
+        return np.log(a * b / (a + b)) + np.logaddexp(up, low)
+
+    def logpmf(self, p, u):
+        a, b, nu, t = p
+        if not (a > 0 and b > 0 and t > 0 and np.isfinite(nu)):
+            return None
+        y0, dy = np.log(u), np.log1p(1 / u)
+        out = np.empty(len(u))
+        # Where log x moves little from u to u + 1, against how fast the
+        # density of log x can change (1/tau, alpha, beta), the two survival
+        # values are too close to subtract: there the mass is that density
+        # integrated over the step (Gauss-Legendre, 4 nodes; error far below
+        # 1e-10 of the mass). Elsewhere a difference of S, or of F where F
+        # is the smaller (below the body, S is near 1).
+        small = dy * max(a, b, 1 / t) < 0.2
+        if small.any():
+            ys = y0[small][:, None] + dy[small][:, None] * GX4
+            out[small] = special.logsumexp(self._logg(p, ys) + np.log(GW4), axis=1) + np.log(dy[small])
+        big = np.flatnonzero(~small)
+        if len(big):
+            y1 = np.log1p(u[big])
+            s0, s1 = self._logsf(p, y0[big]), self._logsf(p, y1)
+            f0, f1 = self._logcdf(p, y0[big]), self._logcdf(p, y1)
+            low = f1 < s0
+            out[big[low]] = f1[low] + np.log(-np.expm1(f0[low] - f1[low]))
+            high = ~low
+            out[big[high]] = s0[high] + np.log(-np.expm1(s1[high] - s0[high]))
+        return out - self._logsf(p, np.array([0.0]))[0]
+
+    def cdf(self, p, u):
+        return -np.expm1(self._logsf(p, np.log1p(u)) - self._logsf(p, np.array([0.0]))[0])
+
+    def sample(self, rng, p, n):
+        # the whole part of X given X >= 1: S(y) = r S(0) solved for y = log x
+        # by bisection, then floor(e^y)
+        target = np.log(rng.random(n)) + self._logsf(p, np.array([0.0]))[0]
+        lo, hi = np.zeros(n), np.full(n, 62 * np.log(2))
+        for _ in range(64):
+            mid = (lo + hi) / 2
+            beyond = self._logsf(p, mid) > target
+            lo = np.where(beyond, mid, lo)
+            hi = np.where(beyond, hi, mid)
+        return np.floor(np.exp(lo)).astype(np.int64)
+
+    def starts(self, x):
+        lx = np.log(x)
+        m, sd = lx.mean(), max(lx.std(), 0.1)
+        gamma = 1 / max(m, 0.01)  # S(x) = x^-gamma above 1, its maximum likelihood
+        top = np.sort(x)[-max(10, len(x) // 10):]
+        hill = 1 / max(np.log(top / top[0]).mean(), 0.01)
+        return [[10, 10, m, sd],             # about the lognormal
+                [gamma, 2, 0, 0.5],          # about the power law above 1
+                [gamma, 5, -2, 1],
+                [hill, 2, np.median(lx), sd / 2]]
+
+    def fit_custom(self, x, u, c):
+        def nll(q):
+            lp = self.logpmf([np.exp(q[0]), np.exp(q[1]), q[2], np.exp(q[3])], u)
+            if lp is None or not np.all(np.isfinite(lp)):
+                return 1e300
+            return -(c * lp).sum()
+
+        # also from the lognormal's own fit, which this contains as alpha and
+        # beta grow: without it the search can stop short of the lognormal
+        try:
+            ln = fit(Lognormal(), x)[0]
+            extra = [[1e3, 1e3, ln[0], ln[1]]] if len(ln) == 2 else [[ln[0], 2, -100, 5], [ln[0], 2, -10, 1]]
+        except FitFailed:
+            extra = []
+        starts = [[np.log(a), np.log(b), nu, np.log(t)] for a, b, nu, t in self.starts(x) + extra]
+        q, _ = _minimize(nll, starts, self.bounds)
+        return np.array([np.exp(q[0]), np.exp(q[1]), q[2], np.exp(q[3])])
+
+
+def _em_sum(a, m, n):
+    """sum of x^-a over whole x from m to n (arrays; m > 100): the integral
+    plus Euler-Maclaurin's corrections to the third derivative"""
+    L = np.log(n / m)
+    z = (1 - a) * L
+    with np.errstate(invalid="ignore", divide="ignore"):
+        h = np.where(z == 0, 1.0, np.expm1(z) / z)
+    f = lambda t: t ** -a
+    d1 = lambda t: -a * t ** (-a - 1)
+    d3 = lambda t: -a * (a + 1) * (a + 2) * t ** (-a - 3)
+    return m ** (1 - a) * L * h + (f(m) + f(n)) / 2 + (d1(n) - d1(m)) / 12 - (d3(n) - d3(m)) / 720
+
+
+def _head(a, n):
+    """sum of x^-a over x = 1..n, for whole n >= 0 (array); any a"""
+    n = np.asarray(n, dtype=float)
+    terms = np.cumsum(GRID ** -a)
+    out = np.zeros(n.shape)
+    mid = (n >= 1) & (n <= M)
+    out[mid] = terms[n[mid].astype(np.int64) - 1]
+    big = n > M
+    out[big] = terms[-1] + _em_sum(a, M + 1.0, n[big])
+    return out
+
+
+def _log_tail(a, m):
+    """log of the sum of x^-a over x >= m, for whole m >= 1 (array), a > 1"""
+    m = np.asarray(m, dtype=float)
+    out = np.empty(m.shape)
+    small = m <= M
+    with np.errstate(divide="ignore"):
+        out[small] = np.log(special.zeta(a, m[small]))
+    mb = m[~small]
+    # Euler-Maclaurin from m to infinity, scaled by m^-a so it cannot underflow
+    out[~small] = -a * np.log(mb) + np.log(mb / (a - 1) + 0.5 + a / (12 * mb)
+                                          - a * (a + 1) * (a + 2) / (720 * mb ** 3))
+    return out
+
+
+class BrokenPowerLaw:
+    # x_b is a whole number: the data are, and only which counts fall below
+    # it and the factor x_b^(a2-a1) matter. Fitted by profile likelihood:
+    # (a1, a2) by Nelder-Mead for each x_b on a log grid, then on finer grids
+    # between the best one's neighbours, down to single whole numbers.
+    name, params, positive = "broken power law", ("a1", "a2", "x_b"), (False, False, False)
+    side = 10  # counts needed below x_b and from x_b on
+
+    def _logz(self, a1, a2, xb):
+        head = _head(a1, np.array([xb - 1.0]))[0]
+        tail = (a2 - a1) * np.log(xb) + _log_tail(a2, np.array([float(xb)]))[0]
+        return np.logaddexp(np.log(head), tail)
+
+    def logpmf(self, p, u):
+        a1, a2, xb = p
+        if not (a2 > 1 and xb >= 2 and xb == np.round(xb) and np.isfinite(a1)):
+            return None
+        lu = np.log(u)
+        return np.where(u < xb, -a1 * lu, (a2 - a1) * np.log(xb) - a2 * lu) - self._logz(a1, a2, xb)
+
+    def cdf(self, p, u):
+        a1, a2, xb = p
+        lz = self._logz(a1, a2, xb)
+        out = np.empty(len(u))
+        below = u < xb
+        out[below] = np.exp(np.log(_head(a1, u[below])) - lz)
+        out[~below] = -np.expm1((a2 - a1) * np.log(xb) + _log_tail(a2, u[~below] + 1) - lz)
+        return out
+
+    def sample(self, rng, p, n):
+        return ShiftedPowerLaw.sample(self, rng, p, n)
+
+    def fit_custom(self, x, u, c):
+        n = c.sum()
+        cl = np.concatenate([[0.0], np.cumsum(c * np.log(u))])
+        cn = np.concatenate([[0], np.cumsum(c)])
+        xs = np.sort(x)
+        lo, hi = max(2, int(xs[self.side - 1]) + 1), int(xs[-self.side])
+        if lo > hi:
+            raise FitFailed(f"no break with {self.side} counts on each side")
+
+        def profile(xb, starts):
+            k = np.searchsorted(u, xb)  # u[:k] are below x_b
+            hl, tl, tn = cl[k], cl[-1] - cl[k], n - cn[k]
+            lxb = np.log(xb)
+
+            def nll(q):
+                a1, a2 = q[0], 1 + np.exp(q[1])
+                v = a1 * hl + a2 * tl - tn * (a2 - a1) * lxb + n * self._logz(a1, a2, xb)
+                return v if np.isfinite(v) else 1e300
+
+            return _minimize(nll, starts, [(-10, 30), (np.log(1e-4), np.log(50))])
+
+        def grid(a, b):
+            if b - a <= 60:
+                return np.arange(a, b + 1)
+            return np.unique(np.round(np.geomspace(a, b, 60))).astype(np.int64)
+
+        done = {}
+        last = np.array([1.5, 0.0])
+        while True:
+            for xb in grid(lo, hi):
+                if xb not in done:
+                    done[xb] = profile(float(xb), [last, [1.5, 0.0]])
+                    last = done[xb][0]
+            keys = sorted(done)
+            i = min(range(len(keys)), key=lambda j: done[keys[j]][1])
+            lo, hi = keys[max(i - 1, 0)], keys[min(i + 1, len(keys) - 1)]
+            if all(v in done for v in range(lo, hi + 1)):
+                break
+        xb = keys[i]
+        q = done[xb][0]
+        return np.array([q[0], 1 + np.exp(q[1]), float(xb)])
+
+
+def rank_size(x):
+    """least-squares fits of log count on log rank: DGBD and Zipf"""
+    y = np.log(np.sort(x)[::-1].astype(float))
+    n = len(y)
+    r = np.arange(1, n + 1, dtype=float)
+    cols = np.column_stack([np.ones(n), -np.log(r), np.log(n + 1 - r)])
+    print("  rank-size fits, by least squares of log count on log rank (not a likelihood,"
+          " so not comparable by AIC):")
+    ss = ((y - y.mean()) ** 2).sum()
+    if ss == 0:
+        print("    all counts are equal: nothing to fit")
+        return
+    for name, form, k in (("DGBD", "f(r) = A (N+1-r)^b / r^a", 3), ("Zipf", "f(r) = A / r^a", 2)):
+        coef = np.linalg.lstsq(cols[:, :k], y, rcond=None)[0]
+        r2 = 1 - ((y - cols[:, :k] @ coef) ** 2).sum() / ss
+        b = f"b={coef[2]:.4g}, " if k == 3 else ""
+        print(f"    {name}  {form:26s} A={np.exp(coef[0]):.4g}, a={coef[1]:.4g}, {b}R^2={r2:.4f}")
+
+
 MODELS = [PowerLaw(), ShiftedPowerLaw(), YuleSimon(), TruncatedPowerLaw(), Lognormal(),
-          StretchedExponential(), Exponential()]
+          StretchedExponential(), Exponential(), DoubleParetoLognormal(), BrokenPowerLaw()]
+# New ones go last: a bootstrap's seed comes from its model's place here.
 # (smaller, larger): the smaller is the larger with one parameter fixed.
 # The exponential, made whole, is the truncated power law with alpha = 0.
 NESTED = {("power law", "truncated power law"), ("power law", "shifted power law"),
@@ -503,6 +852,12 @@ def fit(model, x):
     limit they degenerate to, and the better of the two is kept."""
     u, c = np.unique(x, return_counts=True)
     u = u.astype(float)
+    if hasattr(model, "fit_custom"):  # double Pareto-lognormal, broken power law
+        best = model.fit_custom(x, u, c)
+        lp = model.logpmf(best, u)
+        if lp is None or not np.all(np.isfinite(lp)):
+            raise FitFailed("no finite likelihood")
+        return best, lp, u, c
 
     def search(m, starts):
         def nll(p):
@@ -565,30 +920,168 @@ def ks(model, p, u, c):
     return np.max(np.abs(emp - model.cdf(p, u)))
 
 
-def bootstrap_one(job):
-    """KS distance of one data set drawn from the fitted distribution to
-    its own fit, or None if it could not be fitted."""
-    seed, i, p, n = job
-    model = MODELS[i]
-    rng = np.random.default_rng(seed)
+def ad(model, p, u, c):
+    """Anderson-Darling distance A2 for a discrete distribution, in the
+    form of Choulakian, Lockhart & Stephens (1994) for grouped data:
+    A2 = n * sum over cells of (S - H)^2 h / (H (1 - H)), with S the
+    data's and H the distribution's cumulative share at the end of the
+    cell and h the distribution's share of the cell. The cells end at
+    the values that occur (u), so the values between two of them are one
+    cell: summing over every whole number up to 1e11 cannot be done.
+    Cells where H is 0 or 1 to machine precision are left out, as in the
+    paper. KS D is the largest gap anywhere; this sums all gaps and
+    divides by H (1 - H), so gaps at the two ends (the rarely and the
+    most executed locations) count most."""
+    n = c.sum()
     with np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore"):
-        s = model.sample(rng, p, n)
+        H = np.asarray(model.cdf(p, u), dtype=float)
+        S = np.cumsum(c) / n
+        h = np.diff(H, prepend=0.0)
+        w = H * (1 - H)
+        ok = np.isfinite(w) & (w > 0) & (h > 0)
+        return float(n * ((S[ok] - H[ok]) ** 2 * h[ok] / w[ok]).sum())
+
+
+def fake(i, p, n, k):
+    """Bootstrap k of model i: n counts drawn from the model with the
+    parameters p. The same on every run (seeded by SEED, i and k, not by
+    -b or -j), so a saved bootstrap can be drawn again instead of stored."""
+    rng = np.random.default_rng(np.random.SeedSequence([SEED, i], spawn_key=(k,)))
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore", under="ignore"):
+        return MODELS[i].sample(rng, p, n)
+
+
+def bootstrap_one(job):
+    """One data set drawn from the fitted distribution, fitted again: its
+    parameters, and its KS and Anderson-Darling distances to that fit.
+    Everything else about it can be worked out later from these and
+    fake(), without fitting again."""
+    k, i, p, n = job
+    start = time.time()
+    model = MODELS[i]
+    s = fake(i, p, n, k)
     try:
-        p, _, u, c = fit(model, s)
-    except FitFailed:
+        q, lp, u, c = fit(model, s)
+    except FitFailed as e:
+        return {"k": k, "failed": str(e), "secs": round(time.time() - start, 1)}
+    return {"k": k, "p": [float(v) for v in q], "d": float(ks(model, q, u, c)),
+            "ad": ad(model, q, u, c), "ll": float((c * lp).sum()),
+            "distinct": len(u), "max": int(u[-1]), "sum": int(s.sum()),
+            "secs": round(time.time() - start, 1)}
+
+
+# FD_CHECKPOINT=<dir> (environment variable): nothing computed is lost
+# when a run is stopped, and a rerun of the same command goes on where it
+# stopped. In <dir>, per list and distribution (<list path>.<name>):
+#   .fit    the data's fit: parameters, log-likelihood, KS D, A2. Written
+#           when the fit is done; a rerun reads it instead of fitting.
+#   .fakes  one line per finished bootstrap (JSON): its number k, its own
+#           fitted parameters p, KS D d, A2 ad, log-likelihood ll. First
+#           line: what they were drawn from. Appended as each finishes.
+#   .tally  how many are done and how many fit worse than the data.
+# A bootstrap's data is not stored: fake(i, p, n, k) draws it again, with
+# i, p, n from the first line of .fakes. A file that does not belong to
+# this data or fit is moved aside (.stale-<time>), never deleted.
+FIT_VERSION = 1  # raise when a change to the fitting changes its results
+
+
+def checkpoint_base(path, i):
+    cdir = os.environ.get("FD_CHECKPOINT")
+    if not cdir:
         return None
-    return ks(model, p, u, c)
+    os.makedirs(cdir, exist_ok=True)
+    return os.path.join(cdir, os.path.abspath(path).strip("/").replace("/", "_")
+                        + "." + MODELS[i].name.replace(" ", "-"))
 
 
-def gof(i, p, n, d, reps, jobs):
-    """(bootstraps that fit worse than the data, bootstraps that could be
-    fitted)"""
-    # one seed per bootstrap, so the result does not depend on -j
-    seeds = np.random.SeedSequence([SEED, i]).spawn(reps)
-    with ProcessPoolExecutor(max_workers=jobs) as ex:
-        ds = [r for r in ex.map(bootstrap_one, [(s, i, p, n) for s in seeds], chunksize=4)
-              if r is not None]
-    return sum(r >= d for r in ds), len(ds)
+def write_whole(file, text):
+    """replaces the file in one step: a stop leaves the old or the new"""
+    tmp = f"{file}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, file)
+
+
+def set_aside(file):
+    os.replace(file, f"{file}.stale-{time.strftime('%Y%m%d-%H%M%S')}")
+
+
+def saved_fit(base, key):
+    """the data's fit as saved by an earlier run, or None"""
+    if not base or not os.path.exists(base + ".fit"):
+        return None
+    try:
+        with open(base + ".fit") as f:
+            r = json.load(f)
+    except ValueError:
+        r = None
+    if not isinstance(r, dict) or r.get("key") != key:
+        set_aside(base + ".fit")
+        return None
+    return r
+
+
+def gof(i, p, n, d, a, reps, jobs, path=None):
+    """(bootstraps that fit worse than the data by KS D, by A2, bootstraps
+    that could be fitted)"""
+    # a bootstrap's seed comes from its number, so the result does not
+    # depend on -j, and more can be added later with a larger -b
+    base = checkpoint_base(path, i) if path else None
+    have = {}
+    log = base + ".fakes" if base else None
+    if log:
+        head = {"model": MODELS[i].name, "i": i, "seed": SEED, "n": int(n),
+                "p": [float(v) for v in p]}
+        info = {"d": float(d), "ad": float(a), "numpy": np.__version__, "fit_version": FIT_VERSION}
+        if os.path.exists(log):
+            with open(log) as f:
+                lines = f.read().splitlines()
+            try:
+                old = json.loads(lines[0])
+            except (ValueError, IndexError):
+                old = {}
+            if isinstance(old, dict) and all(old.get(k) == v for k, v in head.items()) \
+                    and old.get("fit_version") == FIT_VERSION:
+                for line in lines[1:]:
+                    # a stop can cut the last line short
+                    try:
+                        r = json.loads(line)
+                        have[int(r["k"])] = r
+                    except (ValueError, KeyError, TypeError):
+                        pass
+            else:
+                set_aside(log)
+        write_whole(log, "".join(json.dumps(r) + "\n" for r in
+                                 [{**head, **info}] + [have[k] for k in sorted(have)]))
+
+    def count():
+        rs = [r for k, r in have.items() if k < reps and "failed" not in r]
+        return sum(r["d"] >= d for r in rs), sum(r["ad"] >= a for r in rs), len(rs)
+
+    def note():
+        if log:
+            wk, wa, fitted = count()
+            write_whole(base + ".tally",
+                        f"{sum(k < reps for k in have)} of {reps} bootstraps done, {fitted} fitted; "
+                        f"fit worse than the data: {wk} by KS, {wa} by AD\n")
+
+    note()
+    todo = [k for k in range(reps) if k not in have]
+    if todo:
+        with ProcessPoolExecutor(max_workers=jobs) as ex:
+            futs = [ex.submit(bootstrap_one, (k, i, p, n)) for k in todo]
+            for fu in as_completed(futs):
+                r = fu.result()
+                have[r["k"]] = r
+                if log:
+                    with open(log, "a") as f:
+                        f.write(json.dumps(r) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    note()
+    return count()
 
 
 def fmt_p(p):
@@ -666,16 +1159,39 @@ def analyse(path, x, kernel_n, kernel_sum, objects, reps, kernel, jobs):
     print(f"  {code}")
 
     results, failed = [], []
+    key = {"data": hashlib.sha256(np.ascontiguousarray(x, dtype=np.int64).tobytes()).hexdigest(),
+           "n": len(x), "fit_version": FIT_VERSION}
     for i, model in enumerate(MODELS):
-        try:
-            p, lp, u, c = checked_fit(model, x)
-        except FitFailed as e:
-            failed.append((model, str(e)))
+        base = checkpoint_base(path, i)
+        saved = saved_fit(base, key)
+        start = time.time()
+        if saved and "failed" in saved:
+            failed.append((model, saved["failed"]))
             continue
+        if saved:
+            p = np.array(saved["p"], dtype=float)
+            u, c = np.unique(x, return_counts=True)
+            u = u.astype(float)
+            lp = model.logpmf(p, u)
+        else:
+            try:
+                p, lp, u, c = checked_fit(model, x)
+            except FitFailed as e:
+                failed.append((model, str(e)))
+                if base:
+                    write_whole(base + ".fit", json.dumps(
+                        {"key": key, "model": model.name, "failed": str(e)}) + "\n")
+                continue
         ll = (c * lp).sum()
         # a degenerate fit has one parameter, not the model's two
-        results.append((model, i, dict(p=p, lp=lp, u=u, c=c, ll=ll,
-                                       aic=2 * len(p) - 2 * ll, d=ks(model, p, u, c))))
+        r = dict(p=p, lp=lp, u=u, c=c, ll=ll, aic=2 * len(p) - 2 * ll,
+                 d=ks(model, p, u, c), a=ad(model, p, u, c))
+        results.append((model, i, r))
+        if base and not saved:
+            write_whole(base + ".fit", json.dumps(
+                {"key": key, "model": model.name, "p": [float(v) for v in p], "ll": float(ll),
+                 "aic": float(r["aic"]), "d": float(r["d"]), "ad": r["a"],
+                 "secs": round(time.time() - start, 1)}) + "\n")
     if not results:
         for model, why in failed:
             print(f"  {model.name:22s} fit failed: {why}")
@@ -689,7 +1205,8 @@ def analyse(path, x, kernel_n, kernel_sum, objects, reps, kernel, jobs):
         print(f"fit-distributions: {path}: {reps} bootstraps for each of {plausible} "
               f"distribution{'' if plausible == 1 else 's'}", file=sys.stderr)
 
-    print(f"  {'distribution':22s} {'parameters':34s} {'log-lik':>12s} {'dAIC':>10s} {'KS D':>7s} {'fit p':>7s}")
+    print(f"  {'distribution':22s} {'parameters':34s} {'log-lik':>12s} {'dAIC':>10s} {'KS D':>7s} {'fit p':>7s} "
+          f"{'A2':>10s} {'AD p':>7s}")
     notes = []
     for model, i, r in fitted:
         names = model.params if len(r["p"]) == len(model.params) else ("gamma",)
@@ -699,13 +1216,14 @@ def analyse(path, x, kernel_n, kernel_sum, objects, reps, kernel, jobs):
             notes.append(f"{model.name}: {note}")
         # far behind by AIC, a distribution is ruled out already
         if reps and r["aic"] - best[2]["aic"] <= PLAUSIBLE:
-            worse, done = gof(i, r["p"], len(x), r["d"], reps, jobs)
-            fp = (f"{fmt_fit_p(worse, done):>7s}" if done else "      ?") + \
+            worse, worse_a, done = gof(i, r["p"], len(x), r["d"], r["a"], reps, jobs, path)
+            fp = f"{fmt_fit_p(worse, done):>7s}" if done else "      ?"
+            fa = (f"{fmt_fit_p(worse_a, done):>7s}" if done else "      ?") + \
                 ("" if done == reps else f"  ({done} of {reps} bootstraps fitted)")
         else:
-            fp = f"{'-':>7s}"
+            fp = fa = f"{'-':>7s}"
         print(f"  {model.name:22s} {ps:34s} {r['ll']:12.1f} {r['aic'] - best[2]['aic']:10.1f} "
-              f"{r['d']:7.4f} {fp}")
+              f"{r['d']:7.4f} {fp} {r['a']:10.4g} {fa}")
     for model, why in failed:
         print(f"  {model.name:22s} fit failed: {why}")
     for n in notes:
@@ -713,6 +1231,7 @@ def analyse(path, x, kernel_n, kernel_sum, objects, reps, kernel, jobs):
     if reps:
         print(f"  (fit p: from {reps} bootstraps each, for those within {PLAUSIBLE} of the best AIC;"
               " p < 0.1 rules the distribution out)")
+        print("  (AD p: the same bootstraps, compared by A2 instead of KS D)")
 
     bm, _, br = best
     lbest = np.repeat(br["lp"], br["c"])
@@ -725,6 +1244,7 @@ def analyse(path, x, kernel_n, kernel_sum, objects, reps, kernel, jobs):
         R, pv, verdict = vuong(lbest, np.repeat(r["lp"], r["c"]), larger,
                                pair in BOUNDARY or pair[::-1] in BOUNDARY, len(r["p"]) + len(br["p"]))
         print(f"    {model.name:22s} R={R:10.2f}  p {fmt_p(pv) if pv is not None else '-':9s}  {verdict}")
+    rank_size(x)
     print()
 
 
